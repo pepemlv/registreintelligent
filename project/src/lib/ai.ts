@@ -102,7 +102,7 @@ interface BackendAnalysis {
   keywords?: string[];
 }
 
-const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:3001' : '')).replace(/\/+$/, '');
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:3001' : 'https://registreintelligent-api.onrender.com')).replace(/\/+$/, '');
 
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
