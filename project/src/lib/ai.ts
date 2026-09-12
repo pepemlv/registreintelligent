@@ -102,7 +102,7 @@ interface BackendAnalysis {
   keywords?: string[];
 }
 
-const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:3001' : '')).replace(/\/+$/, '');
 
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -126,14 +126,19 @@ async function postToAi<T>(path: string, body: unknown): Promise<T> {
   const token = await auth.currentUser?.getIdToken();
   if (!token) throw new Error('Veuillez vous connecter avant d\'analyser des documents.');
 
-  const response = await fetch(`${apiBaseUrl}${path}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${apiBaseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new Error('Serveur IA inaccessible. Configurez VITE_API_BASE_URL avec l’URL HTTPS du backend et autorisez ce site dans ALLOWED_ORIGINS.');
+  }
 
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {

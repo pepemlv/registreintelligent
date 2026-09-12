@@ -23,7 +23,7 @@ L'IA locale essaie d'abord Ollama si `OLLAMA_BASE_URL` repond, puis utilise un f
 
 - `FIREBASE_SERVICE_ACCOUNT`: obligatoire.
 - `PORT`: optionnel, par defaut `3001`.
-- `ALLOWED_ORIGINS`: optionnel, les localhost courants sont autorises par defaut.
+- `ALLOWED_ORIGINS`: optionnel, les domaines `registreintelligent.com` et les localhost courants sont autorises par defaut. Ajouter ici toute autre origine de production, separee par une virgule.
 - `ANTHROPIC_API_KEY`: optionnel.
 - `ANTHROPIC_MODEL`: optionnel, par defaut `claude-3-5-sonnet-latest`.
 - `OPENAI_API_KEY`: optionnel.
@@ -31,6 +31,10 @@ L'IA locale essaie d'abord Ollama si `OLLAMA_BASE_URL` repond, puis utilise un f
 - `OLLAMA_BASE_URL`: optionnel, par defaut `http://127.0.0.1:11434`.
 - `OLLAMA_MODEL`: optionnel, par defaut `llama3.2`.
 - `AI_ANALYSIS_MAX_CHARS`: optionnel, par defaut `60000`.
+
+## Deploiement en production
+
+Deployer ce backend sur une URL HTTPS publique. Dans la configuration de build du frontend, definir `VITE_API_BASE_URL` avec cette URL (sans slash final), puis reconstruire et redeployer le frontend. Sans cette variable, le frontend appelle `/api` sur son propre domaine. `localhost:3001` n'est utilise qu'en developpement local.
 
 ## Endpoints
 

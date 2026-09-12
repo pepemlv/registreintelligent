@@ -120,6 +120,8 @@ const analysisMaxChars = Number.isFinite(requestedAnalysisMaxChars)
   : 60000;
 const app = express();
 const defaultAllowedOrigins = [
+  'https://registreintelligent.com',
+  'https://www.registreintelligent.com',
   'https://signataire.com',
   'https://www.signataire.com',
   'http://localhost:5173',
