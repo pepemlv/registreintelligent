@@ -40,7 +40,46 @@
   }
 
   .gradient-text {
-    @apply bg-gradient-to-r from-primary-600 via-primary-500 to-accent-500 bg-clip-text text-transparent;
+    @apply text-primary-700;
+  }
+
+  [class*="bg-gradient-to-"] {
+    background-image: none !important;
+    background-color: #1d4ed8;
+  }
+
+  [class*="bg-gradient-to-"][class~="from-white"] {
+    background-color: #ffffff;
+  }
+
+  [class*="bg-gradient-to-"][class*="from-primary-"] {
+    background-color: #1d4ed8;
+  }
+
+  [class*="bg-gradient-to-"][class~="from-primary-50"],
+  [class*="bg-gradient-to-"][class~="from-primary-100"] {
+    background-color: #eff6ff;
+  }
+
+  [class*="bg-gradient-to-"][class*="from-danger-"] {
+    background-color: #c8102e;
+  }
+
+  [class*="bg-gradient-to-"][class*="from-accent-"] {
+    background-color: #059669;
+  }
+
+  [class*="bg-gradient-to-"][class~="from-accent-50"],
+  [class*="bg-gradient-to-"][class~="from-accent-100"] {
+    background-color: #ecfdf5;
+  }
+
+  [class*="bg-gradient-to-"][class*="from-ink-"] {
+    background-color: #0b1b3a;
+  }
+
+  [class*="bg-gradient-to-"][class*="from-warning-"] {
+    background-color: #d97706;
   }
 
   .glass {
@@ -48,9 +87,39 @@
   }
 
   .grid-pattern {
-    background-image:
-      linear-gradient(to right, rgb(15 23 42 / 0.04) 1px, transparent 1px),
-      linear-gradient(to bottom, rgb(15 23 42 / 0.04) 1px, transparent 1px);
-    background-size: 32px 32px;
+    background-image: none;
+  }
+}
+
+@media (max-width: 767px) and (max-height: 720px) {
+  .landing-hero-content {
+    padding-top: 2.5rem;
+  }
+
+  .landing-hero-badge {
+    margin-bottom: 0.75rem;
+    font-size: 0.75rem;
+  }
+
+  .landing-hero-title {
+    margin-bottom: 0.85rem;
+    font-size: clamp(1.6rem, 5vh, 2.1rem);
+    line-height: 1.06;
+  }
+
+  .landing-hero-description {
+    margin-bottom: 1rem;
+    font-size: clamp(0.78rem, 2.2vh, 0.9rem);
+    line-height: 1.4;
+  }
+
+  .landing-hero-actions {
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .landing-hero-actions button {
+    padding-top: 0.65rem;
+    padding-bottom: 0.65rem;
   }
 }

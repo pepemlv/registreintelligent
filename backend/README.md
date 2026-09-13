@@ -41,6 +41,8 @@ Deployer ce backend sur une URL HTTPS publique. Dans la configuration de build d
 Toutes les routes ci-dessous exigent `Authorization: Bearer <jeton Firebase>`.
 
 - `POST /api/ai/analyze` avec `{ "documentText": "..." }`
+- `POST /api/ai/analyze-word` avec `{ "wordBase64": "<fichier .doc ou .docx en base64>" }`
 - `POST /api/ai/analyze-pdf` avec `{ "pdfBase64": "<octets PDF en base64>" }`
 - `POST /api/ai/vision-ocr` avec `{ "imageDataUrl": "data:image/...;base64,...", "pageNumber": 1 }`
 - `POST /api/ai/chat` avec `{ "documentText": "...", "question": "...", "conversation": [] }`
+- `POST /api/ai/consolidate` avec `{ "reports": [{ "label": "...", "summary": "...", "keyPoints": ["..."] }] }`

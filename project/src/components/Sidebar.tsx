@@ -1,10 +1,10 @@
+import { useEffect, useRef } from 'react';
 import {
   LayoutDashboard,
   Inbox,
   FolderKanban,
   CheckSquare,
   Users,
-  ArrowRightLeft,
   FileText,
   Archive,
   BarChart3,
@@ -12,6 +12,13 @@ import {
   Settings,
   Shield,
   ShoppingCart,
+  Trash2,
+  Briefcase,
+  Package,
+  ContactRound,
+  Building2,
+  Rocket,
+  PanelLeftClose,
 } from 'lucide-react';
 
 export type View =
@@ -20,8 +27,13 @@ export type View =
   | 'dossiers'
   | 'taches'
   | 'achats'
-  | 'collaboration'
+  | 'b2b-catalog'
+  | 'directory'
+  | 'institutions'
+  | 'projects'
   | 'b2b'
+  | 'b2b-opportunities'
+  | 'b2b-partners'
   | 'rapports'
   | 'archive'
   | 'performance'
@@ -32,72 +44,117 @@ export type View =
   | 'search'
   | 'folders'
   | 'bills'
-  | 'reminders';
+  | 'reminders'
+  | 'settings'
+  | 'trash';
 
 interface SidebarProps {
   view: View;
   onNavigate: (view: View) => void;
   collapsed: boolean;
+  onCollapse: () => void;
+  canSeeTrash?: boolean;
+  documentCount?: number;
+  taskCount?: number;
+  isInstitutionAccount?: boolean;
 }
 
-const navSections: {
+function buildNavSections(canSeeTrash: boolean, isInstitutionAccount: boolean): {
   label?: string;
   items: { id: View; label: string; icon: typeof LayoutDashboard; badge?: number }[];
-}[] = [
-  {
-    items: [
-      { id: 'dashboard', label: 'Accueil', icon: LayoutDashboard },
-    ],
-  },
-  {
-    label: 'Registre',
-    items: [
-      { id: 'courriers', label: 'Registre intelligent', icon: Inbox, badge: 18 },
-      { id: 'dossiers', label: 'Dossiers', icon: FolderKanban },
-      { id: 'taches', label: 'Tâches', icon: CheckSquare, badge: 7 },
-    ],
-  },
-  {
-    label: 'Achats',
-    items: [
-      { id: 'achats', label: 'Demandes de cotation', icon: ShoppingCart, badge: 2 },
-    ],
-  },
-  {
-    label: 'Collaboration',
-    items: [
-      { id: 'collaboration', label: 'Collaboration', icon: Users },
-      { id: 'b2b', label: 'Réseau B2B', icon: ArrowRightLeft },
-      { id: 'rapports', label: 'Rapports', icon: FileText },
-    ],
-  },
-  {
-    label: 'Pilotage',
-    items: [
-      { id: 'archive', label: 'Archives', icon: Archive },
-      { id: 'performance', label: 'Performance', icon: BarChart3 },
-      { id: 'assistant', label: 'Copilote IA', icon: Sparkles },
-      { id: 'admin', label: 'Administration', icon: Shield },
-    ],
-  },
-];
+}[] {
+  return [
+    {
+      items: [
+        { id: 'dashboard', label: 'Accueil', icon: LayoutDashboard },
+      ],
+    },
+    {
+      label: 'Registre',
+      items: [
+        { id: 'courriers', label: 'Courriers intelligents', icon: Inbox, badge: 18 },
+        { id: 'dossiers', label: 'Dossiers', icon: FolderKanban },
+        { id: 'taches', label: 'Tâches', icon: CheckSquare, badge: 7 },
+      ],
+    },
+    {
+      label: 'B2B',
+      items: [
+        { id: 'b2b-catalog', label: 'Mes produits & services', icon: Package },
+        { id: 'directory', label: 'Annuaire', icon: ContactRound },
+        { id: 'achats', label: 'Demandes de cotation intelligentes', icon: ShoppingCart },
+        { id: 'b2b-opportunities', label: 'Opportunités', icon: Briefcase },
+        { id: 'b2b-partners', label: 'Prestataires', icon: Users },
+      ],
+    },
+    {
+      label: 'Projets',
+      items: [
+        { id: 'projects', label: 'Projets', icon: Rocket },
+        { id: 'rapports', label: 'Rapports', icon: FileText },
+      ],
+    },
+    ...(isInstitutionAccount ? [{ label: 'Inter-institutions', items: [{ id: 'institutions' as View, label: 'Institutions', icon: Building2 }] }] : []),
+    {
+      label: 'Pilotage',
+      items: [
+        { id: 'archive', label: 'Archives', icon: Archive },
+        { id: 'performance', label: 'Performance', icon: BarChart3 },
+        { id: 'assistant', label: 'Copilote IA', icon: Sparkles },
+        { id: 'admin', label: 'Administration de l’entreprise', icon: Shield },
+        ...(canSeeTrash ? [{ id: 'trash' as View, label: 'Corbeille', icon: Trash2 }] : []),
+      ],
+    },
+  ];
+}
 
-export function Sidebar({ view, onNavigate, collapsed }: SidebarProps) {
+export function Sidebar({ view, onNavigate, collapsed, onCollapse, canSeeTrash = false, documentCount = 0, taskCount = 0, isInstitutionAccount = false }: SidebarProps) {
+  const sidebarRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (collapsed) return;
+
+    const handleOutsideClick = (event: PointerEvent) => {
+      if (!window.matchMedia('(max-width: 767px)').matches) return;
+      if (event.target instanceof Node && !sidebarRef.current?.contains(event.target)) {
+        onCollapse();
+      }
+    };
+
+    document.addEventListener('pointerdown', handleOutsideClick);
+    return () => document.removeEventListener('pointerdown', handleOutsideClick);
+  }, [collapsed, onCollapse]);
+
+  const navSections = buildNavSections(canSeeTrash, isInstitutionAccount).map((section) => ({
+    ...section,
+    items: section.items.map((item) => item.id === 'courriers'
+      ? { ...item, badge: documentCount }
+      : item.id === 'taches' ? { ...item, badge: taskCount } : item),
+  }));
   return (
     <aside
-      className={`${
-        collapsed ? 'w-[68px]' : 'w-[248px]'
-      } shrink-0 transition-all duration-300 bg-ink-900 flex flex-col h-screen sticky top-0`}
+      ref={sidebarRef}
+      style={{ width: collapsed ? 68 : 248 }}
+      className="shrink-0 overflow-hidden transition-[width] duration-500 ease-in-out bg-ink-900 flex flex-col h-screen sticky top-0"
     >
       <div className="h-16 flex items-center gap-3 px-4 border-b border-white/10">
-        <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-primary-400 to-accent-400 flex items-center justify-center shrink-0 shadow-lg shadow-primary-500/20">
-          <FileText className="h-5 w-5 text-white" strokeWidth={2.5} />
-        </div>
+        <img src="/logo-registre.png" alt="" className="h-9 w-9 shrink-0 rounded-lg bg-white object-contain p-0.5 shadow-lg" />
         {!collapsed && (
-          <div className="animate-fade-in overflow-hidden">
+          <div className="animate-fade-in min-w-0 flex-1 overflow-hidden">
             <p className="font-display font-bold text-white text-sm leading-tight">Registre intelligent</p>
             <p className="text-[10px] text-ink-400 leading-tight">Gestion intelligente</p>
           </div>
+        )}
+        {!collapsed && (
+          <button
+            type="button"
+            onClick={onCollapse}
+            aria-label="Réduire le menu"
+            title="Réduire le menu"
+            className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-ink-300 transition-colors hover:bg-white/10 hover:text-white md:hidden"
+          >
+            <PanelLeftClose className="h-5 w-5" />
+          </button>
         )}
       </div>
 
@@ -105,7 +162,7 @@ export function Sidebar({ view, onNavigate, collapsed }: SidebarProps) {
         {navSections.map((section, si) => (
           <div key={si} className="mb-3">
             {!collapsed && section.label && (
-              <p className="px-3 mb-1.5 text-[9px] font-bold uppercase tracking-wider text-ink-500">
+              <p className="px-3 mb-1.5 text-xs font-bold uppercase tracking-wider text-white">
                 {section.label}
               </p>
             )}
@@ -145,7 +202,7 @@ export function Sidebar({ view, onNavigate, collapsed }: SidebarProps) {
       </nav>
 
       <div className="p-3 border-t border-white/10">
-        <button className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-sm font-medium text-ink-400 hover:bg-white/5 hover:text-white transition-all">
+        <button onClick={() => onNavigate('settings')} className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-sm font-medium transition-all ${view === 'settings' ? 'bg-white/10 text-white' : 'text-ink-400 hover:bg-white/5 hover:text-white'}`}>
           <Settings className="h-5 w-5 shrink-0" strokeWidth={2} />
           {!collapsed && <span>Paramètres</span>}
         </button>

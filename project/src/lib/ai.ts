@@ -13,6 +13,7 @@ export interface AIProcessResult {
   content_text: string;
   amount_due: number | null;
   due_date: string | null;
+  key_points?: string[];
   priority: string;
   status: string;
   processed_by?: string | null;
@@ -100,6 +101,7 @@ interface BackendAnalysis {
   currency?: string;
   tags?: string[];
   keywords?: string[];
+  keyPoints?: string[];
 }
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:3001' : 'https://registreintelligent-api.onrender.com')).replace(/\/+$/, '');
@@ -184,6 +186,7 @@ function toResult(file: File, fullText: string, analysis: BackendAnalysis, engin
     content_text: fullText || `${file.name}\n\nAucun texte lisible n'a été extrait.`,
     amount_due: amount,
     due_date: dueDate,
+    key_points: Array.isArray(analysis.keyPoints) ? analysis.keyPoints.filter((point): point is string => typeof point === 'string' && Boolean(point.trim())) : [],
     priority: derivePriority(dueDate, amount),
     status: 'unread',
     processed_by: engine,
@@ -215,6 +218,20 @@ export async function analyzeDocumentFile(file: File, onStepDone?: (step: Analys
     return toResult(file, result.fullText, result.analysis, result.engine);
   }
 
+  const isWord = /\.(doc|docx)$/i.test(file.name)
+    || file.type === 'application/msword'
+    || file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  if (isWord) {
+    const wordBase64 = await fileToBase64(file);
+    const result = await postToAi<{ fullText: string; analysis: BackendAnalysis; engine: string }>('/api/ai/analyze-word', { wordBase64 });
+    notify('extract');
+    await sleep(250);
+    notify('identify');
+    await sleep(250);
+    notify('detect');
+    return toResult(file, result.fullText, result.analysis, result.engine);
+  }
+
   if (!['image/png', 'image/jpeg', 'image/jpg', 'image/webp'].includes(file.type)) {
     throw new Error('L\'extraction réelle prend actuellement en charge les fichiers PDF, PNG, JPG et WEBP.');
   }
@@ -227,6 +244,21 @@ export async function analyzeDocumentFile(file: File, onStepDone?: (step: Analys
   await sleep(250);
   notify('detect');
   return toResult(file, ocr.text, analyzed.analysis, analyzed.engine);
+}
+
+export interface ReportSummaryInput {
+  label: string;
+  summary: string;
+  keyPoints?: string[];
+}
+
+export interface ConsolidatedReport {
+  summary: string;
+  keyPoints: string[];
+}
+
+export async function consolidateReportSummaries(reports: ReportSummaryInput[]): Promise<{ consolidated: ConsolidatedReport; engine: string }> {
+  return postToAi<{ consolidated: ConsolidatedReport; engine: string }>('/api/ai/consolidate', { reports });
 }
 
 export interface AIAnswer {
@@ -284,6 +316,30 @@ export async function askGlobalQuestion(question: string, documents: DocumentIte
     };
   } catch {
     return answerGlobalQuestion(question, documents);
+  }
+}
+
+export async function prepareFrenchReading(doc: DocumentItem, mode: 'summary' | 'full'): Promise<string> {
+  const baseText = mode === 'summary'
+    ? frenchDocumentSummary(doc)
+    : frenchText(doc.content_text || doc.summary);
+
+  if (!baseText.trim()) {
+    return `Document ${frenchDocumentTitle(doc)}. Aucun texte lisible n'a été extrait.`;
+  }
+
+  if (mode === 'summary') {
+    return `${frenchDocumentTitle(doc)}. Expéditeur : ${frenchDocumentSender(doc)}. ${baseText}`;
+  }
+
+  try {
+    const result = await postToAi<{ answer: string }>('/api/ai/chat', {
+      question: 'Prépare une version française claire et fidèle pour une lecture vocale. Traduis en français si le texte est dans une autre langue. Garde les noms propres, les montants, les références et les dates. Réponds uniquement avec le texte à lire.',
+      documentText: documentToText(doc),
+    });
+    return frenchText(result.answer || baseText);
+  } catch {
+    return `${frenchDocumentTitle(doc)}. Expéditeur : ${frenchDocumentSender(doc)}. ${baseText}`;
   }
 }
 

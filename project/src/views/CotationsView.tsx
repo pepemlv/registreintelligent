@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   ShoppingCart,
   Plus,
@@ -42,10 +42,19 @@ import {
   Link as LinkIcon,
   Table,
   GripVertical,
+  Upload,
+  CheckSquare,
 } from 'lucide-react';
-import { rfqs as initialRFQs, rfqTemplates } from '@/data';
+import { rfqTemplates } from '@/data';
 import { formatDate, formatCurrency } from '@/lib/documentConfig';
 import type { RFQ, RFQTemplate, RFQStatus, RFQProductLine, RFQFormField, FieldType } from '@/types';
+import { analyzeDocumentFile } from '@/lib/ai';
+import { firestore, getActiveCompanyContext } from '@/lib/firebase';
+import type { Folder } from '@/lib/types';
+import CreateTaskModal from '@/components/CreateTaskModal';
+import FolderPicker from '@/components/FolderPicker';
+import { BUSINESS_CATEGORIES } from '@/lib/businessCategories';
+import { isDrc } from '@/lib/geo';
 
 const statusConfig: Record<RFQStatus, { label: string; bg: string; text: string; dot: string }> = {
   draft: { label: 'Brouillon', bg: 'bg-ink-100', text: 'text-ink-600', dot: 'bg-ink-400' },
@@ -139,33 +148,36 @@ function detectAIContext(prompt: string): keyof typeof aiFieldPresets {
   if (p.includes('laptop') || p.includes('ordinateur') || p.includes('pc') || p.includes('informatique')) return 'laptop';
   if (p.includes('véhicule') || p.includes('vehicule') || p.includes('voiture') || p.includes('location')) return 'vehicule';
   if (p.includes('nettoyage') || p.includes('cleaning')) return 'nettoyage';
-  if (p.includes('bureau') || p.includes('fourniture') || p.includes('papeterie')) return 'bureau';
-  return 'laptop';
+  if (p.includes('bureau') || p.includes('fourniture') || p.includes('papeterie') || p.includes('imprimante') || p.includes('photocopieuse') || p.includes('copieur')) return 'bureau';
+  return 'bureau';
 }
 
 function detectAIProducts(prompt: string): { product: string; quantity: number; specifications: string }[] {
-  const p = prompt.toLowerCase();
-  if (p.includes('laptop') || p.includes('ordinateur')) {
-    return [
-      { product: 'Laptop Core i7', quantity: 20, specifications: '16GB / 512GB SSD' },
-      { product: 'Écran 24"', quantity: 20, specifications: 'Full HD' },
-      { product: 'Dock USB-C', quantity: 20, specifications: 'Universel' },
-    ];
-  }
-  if (p.includes('véhicule') || p.includes('voiture')) {
-    return [
-      { product: 'Berline diesel', quantity: 3, specifications: 'Automatique, climatisée' },
-      { product: 'SUV', quantity: 2, specifications: '4x4, 7 places' },
-    ];
-  }
-  if (p.includes('nettoyage')) return [];
-  if (p.includes('bureau')) {
-    return [
-      { product: 'Ramette papier A4', quantity: 50, specifications: '80g' },
-      { product: 'Cartouche imprimante', quantity: 10, specifications: 'Compatibles' },
-    ];
-  }
-  return [];
+  const source = prompt.trim();
+  const lower = source.toLocaleLowerCase('fr-FR');
+  const numberWords: Record<string, number> = { un: 1, une: 1, deux: 2, trois: 3, quatre: 4, cinq: 5, six: 6, sept: 7, huit: 8, neuf: 9, dix: 10 };
+  const knownProducts = [
+    { pattern: /laptops?|ordinateurs?(?: portables?)?|pc(?:s)?/i, label: 'Ordinateur' },
+    { pattern: /imprimantes?/i, label: 'Imprimante' },
+    { pattern: /photocopieuses?|copieurs?/i, label: 'Photocopieuse' },
+    { pattern: /[ée]crans?/i, label: 'Écran' },
+    { pattern: /v[ée]hicules?|voitures?/i, label: 'Véhicule' },
+    { pattern: /ramettes?|papier/i, label: 'Papier' },
+  ];
+
+  return knownProducts
+    .map(({ pattern, label }) => {
+      const match = pattern.exec(source);
+      if (!match) return null;
+      const before = lower.slice(Math.max(0, match.index - 18), match.index);
+      const quantityMatch = before.match(/(?:^|\s)(\d+|un|une|deux|trois|quatre|cinq|six|sept|huit|neuf|dix)\s*$/i);
+      const rawQuantity = quantityMatch?.[1];
+      const quantity = rawQuantity ? (numberWords[rawQuantity.toLowerCase()] ?? Number(rawQuantity)) : 1;
+      return { product: label, quantity: Number.isFinite(quantity) && quantity > 0 ? quantity : 1, specifications: '', position: match.index };
+    })
+    .filter((product): product is { product: string; quantity: number; specifications: string; position: number } => Boolean(product))
+    .sort((a, b) => a.position - b.position)
+    .map(({ position: _position, ...product }) => product);
 }
 
 function generateReference(): string {
@@ -177,10 +189,11 @@ function generateId(): string {
   return `id-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 }
 
-export function CotationsView() {
-  const [rfqList, setRfqList] = useState<RFQ[]>(initialRFQs);
+interface CotationsProps { companyProfiles?: { owner_id: string; full_name: string; email: string; role_label: string }[]; folders?: Folder[]; }
+
+export function CotationsView({ companyProfiles = [], folders = [] }: CotationsProps) {
+  const [rfqList, setRfqList] = useState<RFQ[]>([]);
   const [selectedRFQ, setSelectedRFQ] = useState<RFQ | null>(null);
-  const [showTemplates, setShowTemplates] = useState(false);
   const [showAICreate, setShowAICreate] = useState(false);
   const [showSupplierForm, setShowSupplierForm] = useState(false);
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -191,22 +204,47 @@ export function CotationsView() {
     fields?: { label: string; type: FieldType; required?: boolean; options?: string[] }[];
   } | null>(null);
   const [search, setSearch] = useState('');
+  const [analyzingTender, setAnalyzingTender] = useState(false);
+  const [tenderError, setTenderError] = useState('');
+  const tenderInputRef = useRef<HTMLInputElement>(null);
+
+  const handleTenderUpload = async (file: File | undefined) => {
+    if (!file) return;
+    setAnalyzingTender(true);
+    setTenderError('');
+    try {
+      const result = await analyzeDocumentFile(file);
+      const products = detectAIProducts(`${result.title} ${result.content_text} ${result.summary}`);
+      const fields = aiFieldPresets[detectAIContext(`${result.title} ${result.content_text}`)] || aiFieldPresets.laptop;
+      setCreateInitial({ title: result.title, description: result.summary || result.content_text.slice(0, 1000), products, fields });
+      setShowCreateForm(true);
+    } catch (error) {
+      setTenderError(error instanceof Error ? error.message : 'Impossible d’analyser cet appel d’offre.');
+    } finally {
+      setAnalyzingTender(false);
+    }
+  };
 
   if (showSupplierForm && selectedRFQ) {
     return <SupplierForm rfq={selectedRFQ} onBack={() => setShowSupplierForm(false)} />;
   }
 
   if (selectedRFQ) {
-    return <RFQDetail rfq={selectedRFQ} onBack={() => setSelectedRFQ(null)} onShowSupplierForm={() => setShowSupplierForm(true)} />;
+    return <RFQDetail rfq={selectedRFQ} folders={folders} companyProfiles={companyProfiles} onBack={() => setSelectedRFQ(null)} onShowSupplierForm={() => setShowSupplierForm(true)} />;
   }
 
   if (showCreateForm) {
     return (
       <CreateRFQForm
         initial={createInitial}
+        supplierProfiles={companyProfiles}
         onBack={() => { setShowCreateForm(false); setCreateInitial(null); }}
         onCreate={(rfq) => {
           setRfqList([rfq, ...rfqList]);
+          // FirestoreBuilder only runs its query when `.then()` is actually invoked (it's
+          // lazily-executed, unlike a real Promise) — a bare `void builder.insert(...)`
+          // never calls `.then()`, so the write would silently never happen without this.
+          void firestore.from('rfqs').insert({ ...rfq, status: rfq.status === 'draft' ? 'draft' : 'active' }).then(() => undefined);
           setShowCreateForm(false);
           setCreateInitial(null);
           setSelectedRFQ(rfq);
@@ -214,17 +252,6 @@ export function CotationsView() {
       />
     );
   }
-
-  const handleSelectTemplate = (tpl: RFQTemplate) => {
-    setShowTemplates(false);
-    setCreateInitial({
-      title: tpl.name,
-      description: tpl.description,
-      products: [],
-      fields: [],
-    });
-    setShowCreateForm(true);
-  };
 
   const handleAIGenerate = (prompt: string, fields: { label: string; type: FieldType; required?: boolean; options?: string[] }[], products: { product: string; quantity: number; specifications: string }[]) => {
     setShowAICreate(false);
@@ -248,30 +275,45 @@ export function CotationsView() {
 
   return (
     <div className="p-6 space-y-6 animate-fade-in max-w-[1600px] mx-auto">
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex flex-col items-center gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="text-center sm:text-left">
           <h2 className="font-display font-bold text-ink-900 text-base">Demandes de cotation intelligentes</h2>
           <p className="text-xs text-ink-500">Créez, publiez, recevez les offres et laissez l'IA comparer et recommander</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex w-full flex-col items-center gap-2 sm:w-auto sm:flex-row">
+          <input ref={tenderInputRef} type="file" accept="application/pdf,image/*,.doc,.docx" onChange={(event) => { void handleTenderUpload(event.target.files?.[0]); event.target.value = ''; }} className="hidden" />
+          <button onClick={() => tenderInputRef.current?.click()} disabled={analyzingTender} className="flex w-full items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-primary-700 bg-primary-50 hover:bg-primary-100 disabled:opacity-50 transition-colors sm:w-auto">
+            <Upload className="h-3.5 w-3.5" /> {analyzingTender ? 'Analyse en cours...' : 'Importer un appel d’offre'}
+          </button>
           <button
             onClick={() => setShowAICreate(true)}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-gradient-to-r from-primary-600 to-accent-600 text-white shadow-lg shadow-primary-600/20 hover:shadow-primary-600/40 transition-all"
+            className="flex w-full items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold bg-gradient-to-r from-primary-600 to-accent-600 text-white shadow-lg shadow-primary-600/20 hover:shadow-primary-600/40 transition-all sm:w-auto"
           >
             <Sparkles className="h-3.5 w-3.5" />
             Créer avec l'IA
           </button>
           <button
-            onClick={() => setShowTemplates(true)}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-white bg-primary-600 hover:bg-primary-700 transition-colors"
+            onClick={() => { setCreateInitial(null); setShowCreateForm(true); }}
+            className="flex w-full items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-white bg-primary-600 hover:bg-primary-700 transition-colors sm:w-auto"
           >
             <Plus className="h-3.5 w-3.5" />
-            Nouvelle demande
+            Créer manuellement
           </button>
         </div>
       </div>
+      {tenderError && <div className="rounded-xl border border-danger-200 bg-danger-50 px-4 py-3 text-xs text-danger-700">{tenderError}</div>}
 
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <section className="hidden rounded-2xl border border-primary-200/60 bg-gradient-to-r from-primary-50 to-accent-50/50 p-5 sm:block">
+        <div className="flex items-start gap-3">
+          <div className="h-10 w-10 rounded-xl bg-primary-600 flex items-center justify-center shrink-0"><ShoppingCart className="h-5 w-5 text-white" /></div>
+          <div>
+            <h2 className="text-base font-bold text-ink-900">Présentation des achats</h2>
+            <p className="text-sm text-ink-600 mt-1 max-w-3xl">Suivez chaque demande de cotation depuis l’état de besoin jusqu’à la comparaison des offres et à l’attribution. Les fournisseurs, prix, proformas, délais et décisions restent visibles et traçables dans un même espace.</p>
+          </div>
+        </div>
+      </section>
+
+      <div className="hidden grid-cols-2 gap-4 sm:grid lg:grid-cols-4">
         <SummaryCard icon={ShoppingCart} label="Total demandes" value={rfqList.length.toString()} color="text-primary-600" bg="bg-primary-50" />
         <SummaryCard icon={Clock} label="En cours" value={openCount.toString()} color="text-accent-600" bg="bg-accent-50" />
         <SummaryCard icon={CheckCircle2} label="Clôturées" value={closedCount.toString()} color="text-ink-600" bg="bg-ink-100" />
@@ -354,14 +396,6 @@ export function CotationsView() {
         <p className="text-xs text-ink-500 mt-3">Tout reste connecté à votre coeur documentaire : les demandes, offres, proformas, échanges, validations et décisions deviennent automatiquement un dossier archivé et traçable.</p>
       </div>
 
-      {showTemplates && (
-        <TemplatesModal
-          onClose={() => setShowTemplates(false)}
-          onSelectTemplate={handleSelectTemplate}
-          onCreateCustom={() => { setShowTemplates(false); setCreateInitial(null); setShowCreateForm(true); }}
-        />
-      )}
-
       {showAICreate && (
         <AICreateModal onClose={() => setShowAICreate(false)} onGenerate={handleAIGenerate} />
       )}
@@ -369,7 +403,9 @@ export function CotationsView() {
   );
 }
 
-function RFQDetail({ rfq, onBack, onShowSupplierForm }: { rfq: RFQ; onBack: () => void; onShowSupplierForm: () => void }) {
+function RFQDetail({ rfq, folders, companyProfiles, onBack, onShowSupplierForm }: { rfq: RFQ; folders: Folder[]; companyProfiles: { owner_id: string; full_name: string; email: string; role_label: string }[]; onBack: () => void; onShowSupplierForm: () => void }) {
+  const [showTask, setShowTask] = useState(false);
+  const [folderId, setFolderId] = useState<string | null>(null);
   const sortedSubs = [...rfq.submissions].sort((a, b) => (b.score || 0) - (a.score || 0));
   const recommended = rfq.submissions.find((s) => s.id === rfq.aiRecommendedSupplierId);
   const cfg = statusConfig[rfq.status];
@@ -415,6 +451,11 @@ function RFQDetail({ rfq, onBack, onShowSupplierForm }: { rfq: RFQ; onBack: () =
             <span className="text-xs font-medium text-primary-700">{rfq.attachmentName}</span>
           </div>
         )}
+        <div className="flex flex-wrap items-center gap-2 mt-4 pt-4 border-t border-ink-100">
+          <button onClick={() => setShowTask(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-white bg-primary-600 hover:bg-primary-700"><CheckSquare className="h-3.5 w-3.5" /> Créer une tâche</button>
+          <FolderPicker folders={folders} selectedFolderId={folderId} onSelect={async (id) => { setFolderId(id); await firestore.from('rfq_folder_links').insert({ rfq_id: rfq.id, folder_id: id, title: rfq.title }); }} onFolderCreated={() => undefined} label="Placer dans un dossier" align="left" />
+          <span className="text-[10px] text-ink-400">La demande reste visible dans la liste originale.</span>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -623,6 +664,7 @@ function RFQDetail({ rfq, onBack, onShowSupplierForm }: { rfq: RFQ; onBack: () =
           </div>
         </div>
       </div>
+      {showTask && <CreateTaskModal companyProfiles={companyProfiles} sourceDocument={{ id: rfq.id, title: rfq.title }} onClose={() => setShowTask(false)} onCreated={() => undefined} />}
     </div>
   );
 }
@@ -651,14 +693,22 @@ interface CreateRFQFormProps {
   } | null;
   onBack: () => void;
   onCreate: (rfq: RFQ) => void;
+  supplierProfiles: { owner_id: string; full_name: string; email: string; role_label: string; company_id?: string; company_name?: string }[];
 }
 
-function CreateRFQForm({ initial, onBack, onCreate }: CreateRFQFormProps) {
+function CreateRFQForm({ initial, onBack, onCreate, supplierProfiles }: CreateRFQFormProps) {
   const [step, setStep] = useState(0);
   const [title, setTitle] = useState(initial?.title || '');
   const [reference] = useState(generateReference());
   const [deadline, setDeadline] = useState('2026-09-30');
   const [deliveryLocation, setDeliveryLocation] = useState('Kinshasa');
+  const [supplierScope, setSupplierScope] = useState<'local' | 'national'>('local');
+  const [supplierCategory, setSupplierCategory] = useState<'prime' | 'fabricant' | 'revendeur' | 'prestataire' | 'sous_traitant'>('prime');
+  const [companyIsDrc, setCompanyIsDrc] = useState(true);
+  const [visibility, setVisibility] = useState<'all' | 'category' | 'specific'>('all');
+  const [visibilityCategories, setVisibilityCategories] = useState<string[]>([]);
+  const [visibilitySupplierIds, setVisibilitySupplierIds] = useState<string[]>([]);
+  const [supplierSearch, setSupplierSearch] = useState('');
   const [description, setDescription] = useState(initial?.description || '');
   const [hasAttachment, setHasAttachment] = useState(false);
   const [attachmentName, setAttachmentName] = useState('');
@@ -675,6 +725,35 @@ function CreateRFQForm({ initial, onBack, onCreate }: CreateRFQFormProps) {
     }))
   );
   const [scoringCriteria, setScoringCriteria] = useState(defaultScoringCriteria);
+
+  useEffect(() => {
+    const company = getActiveCompanyContext();
+    if (!company) return;
+    firestore.from<{ country?: string }>('companies').select().eq('id', company.id).single().then(({ data }) => {
+      const record = data as { country?: string } | null;
+      if (record?.country) setCompanyIsDrc(isDrc(record.country));
+    });
+  }, []);
+
+  const supplierOptions = supplierProfiles.reduce<{ id: string; name: string; city: string; logoColor: string }[]>((list, profile) => {
+    const id = profile.company_id || profile.owner_id;
+    const name = profile.company_name || profile.full_name;
+    if (!list.some((company) => company.id === id)) list.push({ id, name, city: 'Entreprise enregistrée', logoColor: 'bg-primary-600' });
+    return list;
+  }, []);
+  const supplierSearchResults = supplierOptions.filter((co) => {
+    if (!supplierSearch.trim()) return false;
+    const q = supplierSearch.toLowerCase();
+    return co.name.toLowerCase().includes(q) || co.city.toLowerCase().includes(q);
+  });
+
+  const toggleVisibilityCategory = (cat: string) => {
+    setVisibilityCategories((current) => current.includes(cat) ? current.filter((c) => c !== cat) : [...current, cat]);
+  };
+
+  const toggleVisibilitySupplier = (id: string) => {
+    setVisibilitySupplierIds((current) => current.includes(id) ? current.filter((c) => c !== id) : [...current, id]);
+  };
 
   const addCriterion = () => {
     setScoringCriteria([...scoringCriteria, { label: 'Nouveau critère', weight: 5 }]);
@@ -728,6 +807,11 @@ function CreateRFQForm({ initial, onBack, onCreate }: CreateRFQFormProps) {
       createdDate: '2026-09-06',
       deadline,
       deliveryLocation,
+      supplierScope,
+      supplierCategory,
+      visibility,
+      visibilityCategories: visibility === 'category' ? visibilityCategories : [],
+      visibilitySupplierIds: visibility === 'specific' ? visibilitySupplierIds : [],
       description: description.trim() || title.trim(),
       hasAttachment,
       attachmentName: hasAttachment ? attachmentName || 'Cahier-des-charges.pdf' : undefined,
@@ -1018,6 +1102,95 @@ function CreateRFQForm({ initial, onBack, onCreate }: CreateRFQFormProps) {
         {step === 4 && (
           <div className="bg-white rounded-2xl shadow-card border border-ink-200/60 p-6 space-y-4 animate-fade-in">
             <h2 className="font-display font-bold text-ink-900 text-base">5 — Vérification et publication</h2>
+            <div className="rounded-xl border border-primary-200 bg-primary-50/50 p-4 space-y-3">
+              <div><p className="text-xs font-bold text-primary-800">Fournisseurs autorisés à voir cette offre</p><p className="text-[10px] text-ink-500 mt-1">Ces critères déterminent qui pourra consulter et répondre à la demande.</p></div>
+              <div className="grid sm:grid-cols-2 gap-3">
+                <div><label className="text-[10px] font-semibold text-ink-600 mb-1 block">Portée géographique</label><select value={supplierScope} onChange={(e) => setSupplierScope(e.target.value as 'local' | 'national')} className="w-full px-3 py-2 bg-white rounded-lg border border-ink-200 text-sm outline-none focus:border-primary-400"><option value="local">{companyIsDrc ? 'Local — même province' : 'Local — même ville'}</option><option value="national">National — tout le pays</option></select></div>
+                <div><label className="text-[10px] font-semibold text-ink-600 mb-1 block">Catégorie de fournisseur</label><select value={supplierCategory} onChange={(e) => setSupplierCategory(e.target.value as typeof supplierCategory)} className="w-full px-3 py-2 bg-white rounded-lg border border-ink-200 text-sm outline-none focus:border-primary-400"><option value="prime">Fournisseur principal</option><option value="fabricant">Fabricant</option><option value="revendeur">Revendeur</option><option value="prestataire">Prestataire de services</option><option value="sous_traitant">Sous-traitant</option></select></div>
+              </div>
+
+              <div className="pt-3 border-t border-primary-200/60">
+                <p className="text-[10px] font-semibold text-ink-600 mb-1.5">Visibilité de l'offre</p>
+                <div className="grid grid-cols-3 gap-2 mb-3">
+                  {([
+                    { id: 'all' as const, label: 'Tous les fournisseurs' },
+                    { id: 'category' as const, label: 'Par catégorie de service' },
+                    { id: 'specific' as const, label: 'Fournisseurs spécifiques' },
+                  ]).map((v) => (
+                    <button
+                      key={v.id}
+                      type="button"
+                      onClick={() => setVisibility(v.id)}
+                      className={`px-2 py-2 rounded-lg text-[11px] font-semibold border transition-all ${
+                        visibility === v.id ? 'bg-primary-600 text-white border-primary-600' : 'bg-white text-ink-600 border-ink-200 hover:border-primary-300'
+                      }`}
+                    >
+                      {v.label}
+                    </button>
+                  ))}
+                </div>
+
+                {visibility === 'category' && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+                    {BUSINESS_CATEGORIES.map((cat) => {
+                      const checked = visibilityCategories.includes(cat);
+                      return (
+                        <label key={cat} className={`flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-[11px] cursor-pointer ${checked ? 'bg-primary-50 border-primary-400 text-primary-700 font-medium' : 'bg-white border-ink-200 text-ink-600'}`}>
+                          <input type="checkbox" checked={checked} onChange={() => toggleVisibilityCategory(cat)} className="accent-primary-600" />
+                          <span className="truncate">{cat}</span>
+                        </label>
+                      );
+                    })}
+                    {visibilityCategories.length === 0 && (
+                      <p className="col-span-full text-[10px] text-warning-600 mt-1">Sélectionnez au moins une catégorie.</p>
+                    )}
+                  </div>
+                )}
+
+                {visibility === 'specific' && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 px-3 py-2 bg-white rounded-lg border border-ink-200">
+                      <Search className="h-3.5 w-3.5 text-ink-400 shrink-0" />
+                      <input
+                        type="text"
+                        value={supplierSearch}
+                        onChange={(e) => setSupplierSearch(e.target.value)}
+                        placeholder="Rechercher un fournisseur par nom..."
+                        className="bg-transparent text-xs outline-none flex-1 placeholder:text-ink-400 text-ink-700"
+                      />
+                    </div>
+                    {supplierSearch.trim() && (
+                      <div className="max-h-48 overflow-y-auto space-y-1 rounded-lg border border-ink-200 bg-white p-1.5">
+                        {supplierSearchResults.length === 0 ? (
+                          <p className="text-[11px] text-ink-400 px-2 py-2">Aucun fournisseur trouvé.</p>
+                        ) : (
+                          supplierSearchResults.map((co) => {
+                            const checked = visibilitySupplierIds.includes(co.id);
+                            return (
+                              <label key={co.id} className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer ${checked ? 'bg-primary-50' : 'hover:bg-ink-50'}`}>
+                                <input type="checkbox" checked={checked} onChange={() => toggleVisibilitySupplier(co.id)} className="accent-primary-600" />
+                                <div className={`h-6 w-6 rounded-md ${co.logoColor} flex items-center justify-center text-white text-[9px] font-bold shrink-0`}>{co.name.slice(0, 2).toUpperCase()}</div>
+                                <div className="min-w-0 flex-1">
+                                  <p className="text-xs font-medium text-ink-800 truncate">{co.name}</p>
+                                  <p className="text-[10px] text-ink-400 flex items-center gap-1"><MapPin className="h-2.5 w-2.5" /> {co.city}</p>
+                                </div>
+                                {checked && <CheckCircle2 className="h-4 w-4 text-primary-600 shrink-0" />}
+                              </label>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
+                    {visibilitySupplierIds.length > 0 && (
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <Users className="h-3 w-3 text-ink-400" />
+                        <span className="text-[10px] text-ink-500">{visibilitySupplierIds.length} fournisseur(s) sélectionné(s)</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
             <div className="p-4 bg-ink-50 rounded-xl space-y-3">
               <div>
                 <p className="text-[10px] font-bold uppercase text-ink-400 mb-1">Titre</p>
@@ -1036,6 +1209,10 @@ function CreateRFQForm({ initial, onBack, onCreate }: CreateRFQFormProps) {
               <div>
                 <p className="text-[10px] font-bold uppercase text-ink-400 mb-1">Lieu de livraison</p>
                 <p className="text-sm text-ink-700">{deliveryLocation || '—'}</p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div><p className="text-[10px] font-bold uppercase text-ink-400 mb-1">Visibilité fournisseur</p><p className="text-sm text-ink-700">{supplierScope === 'local' ? (companyIsDrc ? 'Local — même province' : 'Local — même ville') : 'National — tout le pays'}</p></div>
+                <div><p className="text-[10px] font-bold uppercase text-ink-400 mb-1">Catégorie fournisseur</p><p className="text-sm text-ink-700">{supplierCategory === 'prime' ? 'Fournisseur principal' : supplierCategory}</p></div>
               </div>
               {description && (
                 <div>
@@ -1320,8 +1497,8 @@ function AICreateModal({ onClose, onGenerate }: { onClose: () => void; onGenerat
   const [prompt, setPrompt] = useState('');
   const [generated, setGenerated] = useState(false);
 
-  const context = generated ? detectAIContext(prompt) : 'laptop';
-  const aiFields = aiFieldPresets[context] || aiFieldPresets.laptop;
+  const context = generated ? detectAIContext(prompt) : 'bureau';
+  const aiFields = generated ? (aiFieldPresets[context] || []) : [];
   const aiProducts = generated ? detectAIProducts(prompt) : [];
 
   return (
@@ -1342,11 +1519,6 @@ function AICreateModal({ onClose, onGenerate }: { onClose: () => void; onGenerat
             <p className="text-sm text-ink-600">Décrivez votre besoin en langage naturel. L'IA construira automatiquement le formulaire adapté.</p>
             <div className="flex items-end gap-2 bg-ink-50 rounded-xl border border-ink-200 px-3 py-2">
               <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (prompt.trim()) setGenerated(true); } }} placeholder="Ex: Nous voulons acheter 20 laptops Core i7 pour notre personnel." rows={3} className="flex-1 bg-transparent text-sm outline-none resize-none placeholder:text-ink-400 text-ink-700" />
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {['20 laptops Core i7', 'Location 5 véhicules', 'Prestation de nettoyage', 'Fournitures de bureau'].map((s) => (
-                <button key={s} onClick={() => setPrompt(s)} className="text-[10px] font-medium px-2 py-1 bg-ink-100 text-ink-600 rounded-lg hover:bg-primary-100 hover:text-primary-700 transition-colors">{s}</button>
-              ))}
             </div>
             <button onClick={() => prompt.trim() && setGenerated(true)} disabled={!prompt.trim()} className="w-full py-2.5 rounded-xl text-sm font-bold text-white bg-gradient-to-r from-primary-600 to-accent-600 disabled:from-ink-300 disabled:to-ink-300 hover:shadow-lg transition-all flex items-center justify-center gap-2">
               <Sparkles className="h-4 w-4" /> Générer le formulaire
@@ -1369,7 +1541,7 @@ function AICreateModal({ onClose, onGenerate }: { onClose: () => void; onGenerat
                   {aiProducts.map((p, i) => (
                     <div key={i} className="p-2.5 bg-ink-50 rounded-lg border border-ink-200/60">
                       <p className="text-sm font-medium text-ink-800">{p.product}</p>
-                      <p className="text-[10px] text-ink-500">Quantité: {p.quantity} · {p.specifications}</p>
+                      <p className="text-[10px] text-ink-500">Quantité: {p.quantity} · {p.specifications || 'Caractéristiques non précisées'}</p>
                     </div>
                   ))}
                 </div>

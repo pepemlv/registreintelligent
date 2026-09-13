@@ -47,6 +47,10 @@ function normalizeRegister(raw: unknown): RegisterInfo | undefined {
 export function normalizeDocument(raw: Record<string, unknown>): DocumentItem {
   return {
     id: String(raw.id ?? ''),
+    owner_id: (raw.owner_id as string) || undefined,
+    owner_role: (raw.owner_role as DocumentItem['owner_role']) || undefined,
+    shared_with: Array.isArray(raw.shared_with) ? (raw.shared_with as string[]) : undefined,
+    company_id: (raw.company_id as string) || undefined,
     folder_id: (raw.folder_id as string | null) ?? null,
     title: (raw.title as string) || 'Untitled document',
     sender: (raw.sender as string) || '',

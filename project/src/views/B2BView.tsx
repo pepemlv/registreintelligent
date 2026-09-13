@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Building2,
   Search,
@@ -33,10 +33,18 @@ import {
   HeartPulse,
   Inbox,
   Calendar,
+  CheckSquare,
+  Camera,
 } from 'lucide-react';
-import { partners as initialPartners, networkCompanies, opportunities as initialOpportunities } from '@/data';
+import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
 import { formatDate, formatCurrency } from '@/lib/documentConfig';
 import type { Partner, Company, Opportunity, PartnerRelation, PartnerStatus, OpportunityStatus, CompanyStatus } from '@/types';
+import type { Folder } from '@/lib/types';
+import { firestore, getActiveCompanyContext, storage } from '@/lib/firebase';
+import CreateTaskModal from '@/components/CreateTaskModal';
+import FolderPicker from '@/components/FolderPicker';
+import ProductCatalogManager from '@/components/ProductCatalogManager';
+import CompanyProfileModal from '@/components/CompanyProfileModal';
 
 const statusBadge: Record<CompanyStatus, { label: string; bg: string; text: string }> = {
   verified: { label: 'Vérifié', bg: 'bg-accent-100', text: 'text-accent-700' },
@@ -94,17 +102,85 @@ function generateId(): string {
 }
 
 type Tab = 'all' | 'suppliers' | 'customers';
-type SubView = 'list' | 'detail' | 'add' | 'opportunities' | 'oppDetail';
+export type SubView = 'list' | 'detail' | 'add' | 'opportunities' | 'oppDetail';
 
-export function B2BView() {
-  const [subView, setSubView] = useState<SubView>('list');
+interface RealCompany {
+  id: string;
+  name: string;
+  organization_type?: string;
+  address?: string;
+  city?: string;
+  country?: string;
+  phone?: string;
+  primary_admin_email?: string;
+  is_supplier?: boolean;
+  supplier_offer_type?: string;
+  supplier_categories?: string[];
+  directory_status?: string;
+  logo_url?: string;
+}
+
+export function B2BView({ initialSubView = 'list', companyProfiles = [], folders = [] }: { initialSubView?: SubView; companyProfiles?: { owner_id: string; full_name: string; email: string; role_label: string; company_id?: string; company_name?: string }[]; folders?: Folder[] }) {
+  const [subView, setSubView] = useState<SubView>(initialSubView);
   const [tab, setTab] = useState<Tab>('all');
   const [search, setSearch] = useState('');
-  const [partnerList, setPartnerList] = useState<Partner[]>(initialPartners);
-  const [oppList, setOppList] = useState<Opportunity[]>(initialOpportunities);
+  const [partnerList, setPartnerList] = useState<Partner[]>([]);
+  const [oppList, setOppList] = useState<Opportunity[]>([]);
   const [selectedPartner, setSelectedPartner] = useState<Partner | null>(null);
   const [selectedOpp, setSelectedOpp] = useState<Opportunity | null>(null);
   const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'external' | 'favorites'>('all');
+  const [realCompanies, setRealCompanies] = useState<RealCompany[]>([]);
+  const [selectedRealCompany, setSelectedRealCompany] = useState<RealCompany | null>(null);
+  const [showCatalog, setShowCatalog] = useState(false);
+  const [myCompany, setMyCompany] = useState<RealCompany | null>(null);
+  const [uploadingLogo, setUploadingLogo] = useState(false);
+  const activeCompany = getActiveCompanyContext();
+
+  useEffect(() => {
+    const loadCompaniesAndRelations = async () => {
+      const [companiesResult, relationsResult] = await Promise.all([
+        firestore.from<RealCompany>('companies').select(),
+        firestore.from<{ target_company_id: string; relation: PartnerRelation }>('company_relationships').select(),
+      ]);
+      const everyone = (companiesResult.data as RealCompany[] | null) ?? [];
+      setMyCompany(everyone.find((company) => company.id === activeCompany?.id) ?? null);
+      const all = everyone.filter((company) => company.id !== activeCompany?.id && company.directory_status !== 'suspended');
+      const relations = (relationsResult.data as { target_company_id: string; relation: PartnerRelation }[] | null) ?? [];
+      setRealCompanies(all);
+      setPartnerList(relations.map((item) => {
+        const company = all.find((candidate) => candidate.id === item.target_company_id);
+        if (!company) return null;
+        return {
+          id: `relationship-${company.id}`,
+          company: {
+            id: company.id,
+            name: company.name,
+            logoColor: 'bg-primary-600',
+            address: company.address || '',
+            city: company.city || '—',
+            country: company.country || 'RDC',
+            phone: company.phone || '',
+            email: company.primary_admin_email || '',
+            taxId: '—',
+            sectors: company.supplier_categories || [],
+            productsServices: [],
+            contactPersons: [],
+            docFlowCode: company.id,
+            status: company.is_supplier ? 'verified' : 'unverified',
+            servedZones: [],
+            categories: company.supplier_categories || [],
+          },
+          relation: item.relation,
+          status: 'active',
+          addedDate: new Date().toISOString(),
+          notes: '',
+          favorite: false,
+          isDocFlowMember: true,
+        } as Partner;
+      }).filter((partner): partner is Partner => Boolean(partner)));
+    };
+    void loadCompaniesAndRelations();
+  }, [activeCompany?.id]);
 
   // ===== DETAIL VIEW =====
   if (subView === 'detail' && selectedPartner) {
@@ -122,6 +198,7 @@ export function B2BView() {
           setSelectedPartner(partner);
         }}
         existingPartners={partnerList}
+        companyProfiles={companyProfiles}
       />
     );
   }
@@ -131,6 +208,8 @@ export function B2BView() {
     return (
       <OpportunityDetail
         opp={selectedOpp}
+        folders={folders}
+        companyProfiles={companyProfiles}
         onBack={() => { setSubView('opportunities'); setSelectedOpp(null); }}
         onSubmit={() => {
           setOppList(oppList.map((o) => (o.id === selectedOpp.id ? { ...o, status: 'submitted', submittedDate: '2026-09-06' } : o)));
@@ -176,15 +255,57 @@ export function B2BView() {
   const externalCount = partnerList.filter((p) => !p.isDocFlowMember).length;
   const newOppCount = oppList.filter((o) => o.status === 'new' || o.status === 'to_answer').length;
 
+  const handleLogoUpload = async (file: File) => {
+    if (!activeCompany) return;
+    setUploadingLogo(true);
+    try {
+      const path = `companies/${activeCompany.id}/logo/${Date.now()}-${file.name}`;
+      const uploaded = await uploadBytes(storageRef(storage, path), file);
+      const logoUrl = await getDownloadURL(uploaded.ref);
+      await firestore.from('companies').update({ logo_url: logoUrl }).eq('id', activeCompany.id);
+      setMyCompany((current) => (current ? { ...current, logo_url: logoUrl } : current));
+    } finally {
+      setUploadingLogo(false);
+    }
+  };
+
   return (
     <div className="p-6 space-y-6 animate-fade-in max-w-[1400px] mx-auto">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <div>
-          <h2 className="font-display font-bold text-ink-900 text-base">Partenaires B2B</h2>
-          <p className="text-xs text-ink-500">Une même entreprise peut être votre fournisseur et votre client</p>
+        <div className="flex items-center gap-3">
+          <label className="relative h-11 w-11 rounded-xl overflow-hidden shrink-0 cursor-pointer group ring-1 ring-ink-200" title="Changer le logo de mon entreprise">
+            {myCompany?.logo_url ? (
+              <img src={myCompany.logo_url} alt={myCompany.name} className="h-full w-full object-cover" />
+            ) : (
+              <div className="h-full w-full bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center text-white font-bold text-sm">
+                {(myCompany?.name || activeCompany?.name || '??').slice(0, 2).toUpperCase()}
+              </div>
+            )}
+            <div className="absolute inset-0 bg-ink-900/0 group-hover:bg-ink-900/50 transition-colors flex items-center justify-center">
+              <Camera className="h-4 w-4 text-white opacity-0 group-hover:opacity-100 transition-opacity" />
+            </div>
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              disabled={uploadingLogo}
+              onChange={(e) => { const file = e.target.files?.[0]; if (file) void handleLogoUpload(file); e.target.value = ''; }}
+            />
+          </label>
+          <div>
+            <h2 className="font-display font-bold text-ink-900 text-base">Partenaires B2B</h2>
+            <p className="text-xs text-ink-500">{uploadingLogo ? 'Envoi du logo...' : 'Une même entreprise peut être votre fournisseur et votre client'}</p>
+          </div>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowCatalog(true)}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-accent-700 bg-accent-50 hover:bg-accent-100 transition-colors"
+          >
+            <Package className="h-3.5 w-3.5" />
+            Mon catalogue
+          </button>
           <button
             onClick={() => setSubView('opportunities')}
             className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-primary-600 bg-primary-50 hover:bg-primary-100 transition-colors"
@@ -330,6 +451,64 @@ export function B2BView() {
         </div>
       )}
 
+      {/* All registered companies on the network */}
+      {tab === 'all' && (() => {
+        const realFiltered = realCompanies.filter((c) => {
+          if (!search) return true;
+          const q = search.toLowerCase();
+          return c.name.toLowerCase().includes(q) || (c.city ?? '').toLowerCase().includes(q) || (c.supplier_categories ?? []).some((cat) => cat.toLowerCase().includes(q));
+        });
+        return (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <Building2 className="h-4 w-4 text-ink-400" />
+              <h3 className="text-sm font-bold text-ink-800">Toutes les entreprises inscrites sur Registre intelligent</h3>
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-ink-100 text-ink-500">{realFiltered.length}</span>
+            </div>
+            {realFiltered.length === 0 ? (
+              <div className="bg-white rounded-2xl shadow-card border border-ink-200/60 p-8 text-center">
+                <p className="text-xs text-ink-400">Aucune autre entreprise inscrite pour le moment.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                {realFiltered.map((co) => (
+                  <button
+                    key={co.id}
+                    onClick={() => setSelectedRealCompany(co)}
+                    className="bg-white rounded-2xl shadow-card border border-ink-200/60 p-5 text-left hover:shadow-card-hover hover:border-primary-300 transition-all group"
+                  >
+                    <div className="flex items-center gap-3 mb-3">
+                      {co.logo_url ? (
+                        <img src={co.logo_url} alt={co.name} className="h-11 w-11 rounded-xl object-cover shrink-0 ring-1 ring-ink-200" />
+                      ) : (
+                        <div className="h-11 w-11 rounded-xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center text-white font-bold text-sm shrink-0">
+                          {co.name.slice(0, 2).toUpperCase()}
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <p className="text-sm font-bold text-ink-800 group-hover:text-primary-700 truncate">{co.name}</p>
+                        <p className="text-[10px] text-ink-400">{co.organization_type || 'Entreprise'}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 text-[10px] text-ink-500 mb-3">
+                      {co.city && <span className="flex items-center gap-1"><MapPin className="h-3 w-3" /> {co.city}</span>}
+                    </div>
+                    <div className="flex items-center justify-between pt-3 border-t border-ink-100">
+                      {co.is_supplier ? (
+                        <span className="inline-flex items-center gap-1 text-[9px] font-semibold bg-primary-50 text-primary-700 px-1.5 py-0.5 rounded"><Briefcase className="h-2.5 w-2.5" /> Fournisseur</span>
+                      ) : (
+                        <span className="text-[9px] text-ink-400">Profil entreprise</span>
+                      )}
+                      <ChevronRight className="h-4 w-4 text-ink-300 group-hover:text-primary-500" />
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Company code explainer */}
       <div className="bg-gradient-to-r from-primary-50 to-accent-50/40 rounded-2xl border border-primary-200/40 p-5">
         <div className="flex items-start gap-3">
@@ -350,6 +529,13 @@ export function B2BView() {
           </div>
         </div>
       </div>
+
+      {showCatalog && activeCompany && (
+        <ProductCatalogManager companyId={activeCompany.id} companyName={activeCompany.name} onClose={() => setShowCatalog(false)} />
+      )}
+      {selectedRealCompany && (
+        <CompanyProfileModal company={selectedRealCompany} onClose={() => setSelectedRealCompany(null)} onRelationSaved={() => { setSelectedRealCompany(null); window.location.reload(); }} />
+      )}
     </div>
   );
 }
@@ -360,6 +546,7 @@ function PartnerDetail({ partner, onBack }: { partner: Partner; onBack: () => vo
   const co = partner.company;
   const rCfg = relationBadge[partner.relation];
   const cCfg = statusBadge[co.status];
+  const [showRfqActions, setShowRfqActions] = useState(false);
 
   return (
     <div className="p-6 space-y-5 animate-fade-in max-w-[1200px] mx-auto">
@@ -400,9 +587,26 @@ function PartnerDetail({ partner, onBack }: { partner: Partner; onBack: () => vo
               <Send className="h-3.5 w-3.5" />
               Envoyer un document
             </button>
+            <button onClick={() => setShowRfqActions(true)} className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white bg-primary-600 hover:bg-primary-700 transition-colors flex items-center gap-1.5">
+              <ShoppingCart className="h-3.5 w-3.5" />
+              Envoyer une demande de cotation
+            </button>
           </div>
         </div>
       </div>
+
+      {showRfqActions && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink-900/30 p-4" onMouseDown={(event) => event.target === event.currentTarget && setShowRfqActions(false)}>
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
+            <div className="flex items-center justify-between"><h2 className="text-base font-bold text-ink-900">Envoyer une demande de cotation</h2><button onClick={() => setShowRfqActions(false)} aria-label="Fermer"><X className="h-5 w-5 text-ink-400" /></button></div>
+            <p className="mt-1 text-xs text-ink-500">Choisissez une demande existante ou préparez-en une nouvelle pour {co.name}.</p>
+            <div className="mt-4 space-y-2">
+              <button disabled className="w-full rounded-lg border border-ink-200 px-3 py-3 text-left text-sm text-ink-400 disabled:cursor-not-allowed"><span className="block font-semibold">Sélectionner une cotation existante</span><span className="text-xs">Aucune demande de cotation disponible.</span></button>
+              <button onClick={() => setShowRfqActions(false)} className="w-full rounded-lg bg-primary-600 px-3 py-3 text-left text-sm font-semibold text-white hover:bg-primary-700"><span className="block">Créer une nouvelle demande</span><span className="text-xs font-normal text-white/80">La demande pourra ensuite être adressée à {co.name}.</span></button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         {/* Left: Company info */}
@@ -537,7 +741,7 @@ function InfoRow({ icon: Icon, label, value }: { icon: typeof MapPin; label: str
 
 type AddMethod = 'choose' | 'search' | 'external';
 
-function AddPartnerFlow({ onBack, onAdd, existingPartners }: { onBack: () => void; onAdd: (p: Partner) => void; existingPartners: Partner[] }) {
+function AddPartnerFlow({ onBack, onAdd, existingPartners, companyProfiles }: { onBack: () => void; onAdd: (p: Partner) => void; existingPartners: Partner[]; companyProfiles: { owner_id: string; full_name: string; email: string; role_label: string; company_id?: string; company_name?: string }[] }) {
   const [method, setMethod] = useState<AddMethod>('choose');
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCompany, setSelectedCompany] = useState<Company | null>(null);
@@ -557,7 +761,15 @@ function AddPartnerFlow({ onBack, onAdd, existingPartners }: { onBack: () => voi
   const [extTaxId, setExtTaxId] = useState('');
   const [extNotes, setExtNotes] = useState('');
 
-  const searchResults = networkCompanies.filter((c) => {
+  const registeredCompanies: Company[] = companyProfiles.map((profile) => ({
+    id: profile.company_id || profile.owner_id,
+    name: profile.company_name || profile.full_name,
+    logoColor: 'bg-primary-600',
+    address: '', city: 'Entreprise enregistrée', country: 'RDC', phone: '', email: profile.email, taxId: '—',
+    sectors: [], productsServices: [], contactPersons: [], docFlowCode: profile.company_id || profile.owner_id,
+    status: 'verified', servedZones: [], categories: [],
+  }));
+  const searchResults = registeredCompanies.filter((c) => {
     if (!searchQuery) return false;
     const q = searchQuery.toLowerCase();
     return (
@@ -753,9 +965,9 @@ function AddPartnerFlow({ onBack, onAdd, existingPartners }: { onBack: () => voi
                   <label className="text-xs font-semibold text-ink-600 mb-2 block">Quelle relation ?</label>
                   <div className="grid grid-cols-3 gap-2">
                     {([
-                      { id: 'supplier' as PartnerRelation, label: 'Fournisseur', icon: Briefcase },
-                      { id: 'customer' as PartnerRelation, label: 'Client', icon: ShoppingBag },
-                      { id: 'both' as PartnerRelation, label: 'Les deux', icon: ArrowLeftRight },
+                      { id: 'supplier' as PartnerRelation, label: 'Mon fournisseur', icon: Briefcase },
+                      { id: 'customer' as PartnerRelation, label: 'Mon client', icon: ShoppingBag },
+                      { id: 'both' as PartnerRelation, label: 'Client et fournisseur', icon: ArrowLeftRight },
                     ]).map((r) => (
                       <button
                         key={r.id}
@@ -805,9 +1017,9 @@ function AddPartnerFlow({ onBack, onAdd, existingPartners }: { onBack: () => voi
                 <label className="text-xs font-semibold text-ink-600 mb-2 block">Quelle relation ?</label>
                 <div className="grid grid-cols-3 gap-2">
                   {([
-                    { id: 'supplier' as PartnerRelation, label: 'Fournisseur', icon: Briefcase },
-                    { id: 'customer' as PartnerRelation, label: 'Client', icon: ShoppingBag },
-                    { id: 'both' as PartnerRelation, label: 'Les deux', icon: ArrowLeftRight },
+                    { id: 'supplier' as PartnerRelation, label: 'Mon fournisseur', icon: Briefcase },
+                    { id: 'customer' as PartnerRelation, label: 'Mon client', icon: ShoppingBag },
+                    { id: 'both' as PartnerRelation, label: 'Client et fournisseur', icon: ArrowLeftRight },
                   ]).map((r) => (
                     <button key={r.id} onClick={() => setRelation(r.id)} className={`flex flex-col items-center gap-1 py-2.5 rounded-xl border text-xs font-semibold transition-all ${relation === r.id ? 'bg-primary-600 text-white border-primary-600' : 'bg-ink-50 text-ink-600 border-ink-200 hover:border-primary-300'}`}>
                       <r.icon className="h-4 w-4" /> {r.label}
@@ -913,7 +1125,7 @@ function OpportunitiesView({ opportunities, onBack, onSelect }: { opportunities:
       </div>
 
       {/* Dashboard cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="hidden grid-cols-2 gap-4 sm:grid lg:grid-cols-4">
         <DashboardCard icon={Clock} label="À répondre" value={newCount.toString()} color="text-warning-600" bg="bg-warning-50" />
         <DashboardCard icon={Send} label="Offres envoyées" value={submittedCount.toString()} color="text-accent-600" bg="bg-accent-50" />
         <DashboardCard icon={Award} label="Attribuées" value={awardedCount.toString()} color="text-accent-600" bg="bg-accent-100" />
@@ -922,7 +1134,7 @@ function OpportunitiesView({ opportunities, onBack, onSelect }: { opportunities:
 
       {/* Tabs + Search */}
       <div className="bg-white rounded-2xl shadow-card border border-ink-200/60 p-4 space-y-3">
-        <div className="flex items-center gap-1 border-b border-ink-100 pb-3 overflow-x-auto scrollbar-thin">
+        <div className="hidden items-center gap-1 border-b border-ink-100 pb-3 overflow-x-auto scrollbar-thin sm:flex">
           {([
             { id: 'all' as const, label: 'Toutes', count: opportunities.length },
             { id: 'new' as const, label: 'À répondre', count: newCount },
@@ -935,6 +1147,21 @@ function OpportunitiesView({ opportunities, onBack, onSelect }: { opportunities:
               <span className={`text-[9px] px-1.5 py-0.5 rounded-full ${tab === t.id ? 'bg-white/20' : 'bg-ink-100'}`}>{t.count}</span>
             </button>
           ))}
+        </div>
+        <div className="border-b border-ink-100 pb-3 sm:hidden">
+          <label htmlFor="opportunity-status-filter" className="sr-only">Filtrer les opportunités</label>
+          <select
+            id="opportunity-status-filter"
+            value={tab}
+            onChange={(event) => setTab(event.target.value as typeof tab)}
+            className="w-full rounded-xl border border-ink-200 bg-white px-3 py-2.5 text-sm font-semibold text-ink-700 outline-none focus:border-primary-400"
+          >
+            <option value="all">Toutes ({opportunities.length})</option>
+            <option value="new">À répondre ({newCount})</option>
+            <option value="submitted">Offres envoyées ({submittedCount})</option>
+            <option value="awarded">Attribuées ({awardedCount})</option>
+            <option value="rejected">Non retenues ({rejectedCount})</option>
+          </select>
         </div>
         <div className="flex items-center gap-2 px-3 py-2 bg-ink-50 rounded-xl border border-ink-200">
           <Search className="h-4 w-4 text-ink-400 shrink-0" />
@@ -1015,13 +1242,15 @@ function OpportunitiesView({ opportunities, onBack, onSelect }: { opportunities:
 
 // ====== OPPORTUNITY DETAIL ======
 
-function OpportunityDetail({ opp, onBack, onSubmit }: { opp: Opportunity; onBack: () => void; onSubmit: () => void }) {
+function OpportunityDetail({ opp, folders, companyProfiles, onBack, onSubmit }: { opp: Opportunity; folders: Folder[]; companyProfiles: { owner_id: string; full_name: string; email: string; role_label: string }[]; onBack: () => void; onSubmit: () => void }) {
   const cfg = oppStatusConfig[opp.status];
   const [productPrices, setProductPrices] = useState<Record<string, string>>({});
   const [warranty, setWarranty] = useState('');
   const [deliveryDays, setDeliveryDays] = useState('');
   const [paymentTerms, setPaymentTerms] = useState('');
   const [availability, setAvailability] = useState<'yes' | 'no' | ''>('');
+  const [showTask, setShowTask] = useState(false);
+  const [folderId, setFolderId] = useState<string | null>(null);
 
   const canSubmit = opp.products.every((_, i) => productPrices[`p${i}`]);
 
@@ -1055,6 +1284,11 @@ function OpportunityDetail({ opp, onBack, onSubmit }: { opp: Opportunity; onBack
           </div>
         </div>
         <p className="text-sm text-ink-600 leading-relaxed mt-4">{opp.description}</p>
+        <div className="flex flex-wrap items-center gap-2 mt-5 pt-4 border-t border-ink-100">
+          <button onClick={() => setShowTask(true)} className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-white bg-primary-600 hover:bg-primary-700"><CheckSquare className="h-3.5 w-3.5" /> Créer une tâche</button>
+          <FolderPicker folders={folders} selectedFolderId={folderId} onSelect={async (id) => { setFolderId(id); await firestore.from('opportunity_folder_links').insert({ opportunity_id: opp.id, folder_id: id, title: opp.title }); }} onFolderCreated={() => undefined} label="Placer dans un dossier" align="left" />
+          <span className="text-[10px] text-ink-400">L’opportunité reste visible dans sa liste originale.</span>
+        </div>
       </div>
 
       {/* Products */}
@@ -1177,6 +1411,7 @@ function OpportunityDetail({ opp, onBack, onSubmit }: { opp: Opportunity; onBack
           <p className="text-xs text-ink-400 mt-1">Le client a choisi une autre offre. Vous retrouverez les opportunités disponibles dans votre espace.</p>
         </div>
       )}
+      {showTask && <CreateTaskModal companyProfiles={companyProfiles} sourceDocument={{ id: opp.id, title: opp.title }} onClose={() => setShowTask(false)} onCreated={() => undefined} />}
     </div>
   );
 }

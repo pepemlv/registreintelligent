@@ -42,9 +42,9 @@ function aiEngineLabel(engine?: string | null): string {
 
 export default function UploadModal({ flow }: UploadModalProps) {
   const {
-    activeJob: job, isDraft, draftDirection, setDraftDirection, dragOver, setDragOver, folders,
+    activeJob: job, isDraft, isSaving, draftDirection, setDraftDirection, dragOver, setDragOver, folders,
     startNewScan, startProcessing, updateEdited, updateRegister, setReceivedDate, setSelectedFolderId,
-    handleFolderCreated, handleSave, retryJob, dismissJob, close,
+    handleFolderCreated, handleSave, retryJob, retrySave, dismissJob, close, storageMode, setStorageMode,
   } = flow;
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -128,6 +128,18 @@ export default function UploadModal({ flow }: UploadModalProps) {
                 </div>
               </div>
 
+              <div className="mb-4 p-3 rounded-xl border border-gray-200 bg-gray-50">
+                <label className="text-xs text-gray-500 font-semibold block mb-1.5">Lieu d’archivage</label>
+                <select value={storageMode} onChange={(e) => setStorageMode(e.target.value as typeof storageMode)} className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm font-semibold text-gray-800 outline-none focus:border-usps-blue">
+                  <option value="cloud">☁️ Cloud</option>
+                  <option value="local">📁 Dossier local</option>
+                  <option value="server">🖥️ Serveur local</option>
+                  <option value="hybrid">🔄 Hybride</option>
+                </select>
+                {storageMode === 'local' && <p className="text-[11px] text-gray-500 mt-1.5">Le dossier local doit être choisi dans Paramètres avant l’enregistrement.</p>}
+                {storageMode === 'server' && <p className="text-[11px] text-gray-500 mt-1.5">Configurez d’abord l’URL du serveur local dans Paramètres.</p>}
+              </div>
+
               <div className="grid grid-cols-3 gap-3 mb-4">
                 {SOURCE_META.map((src) => (
                   <button
@@ -151,7 +163,7 @@ export default function UploadModal({ flow }: UploadModalProps) {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/*,.pdf,.heic"
+                accept="image/*,.pdf,.heic,.doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 onChange={handleFileSelect}
                 className="hidden"
               />
@@ -177,7 +189,7 @@ export default function UploadModal({ flow }: UploadModalProps) {
                   {dragOver ? <Upload className="w-7 h-7 text-white" /> : <ScanLine className="w-7 h-7 text-white" />}
                 </div>
                 <p className="font-semibold text-gray-900 mb-1">Ou déposez un fichier ici</p>
-                <p className="text-xs text-gray-400">JPG, PNG, PDF ou WEBP - l'IA le lira et le classera automatiquement</p>
+                <p className="text-xs text-gray-400">JPG, PNG, PDF, WEBP ou Word (.doc, .docx) — l’IA le lira et le classera automatiquement</p>
               </div>
 
               <div className="mt-4 p-4 rounded-xl bg-usps-gray border border-usps-blue/20">
@@ -197,7 +209,9 @@ export default function UploadModal({ flow }: UploadModalProps) {
               <div className="w-14 h-14 rounded-2xl bg-red-50 flex items-center justify-center mx-auto mb-4">
                 <X className="w-7 h-7 text-usps-red" />
               </div>
-              <h3 className="font-semibold text-gray-900 mb-2">Échec de l'extraction</h3>
+              <h3 className="font-semibold text-gray-900 mb-2">
+                {job.edited ? "Échec de l'enregistrement" : "Échec de l'extraction"}
+              </h3>
               <p className="text-sm text-gray-500 mb-5">{job.error}</p>
               <div className="flex gap-3 justify-center">
                 <button
@@ -206,12 +220,21 @@ export default function UploadModal({ flow }: UploadModalProps) {
                 >
                   Annuler
                 </button>
-                <button
-                  onClick={retryJob}
-                  className="px-4 py-2.5 bg-usps-blue text-white rounded-xl text-sm font-semibold hover:bg-usps-blue-dark transition-colors"
-                >
-                  Essayer un autre fichier
-                </button>
+                {job.edited ? (
+                  <button
+                    onClick={retrySave}
+                    className="px-4 py-2.5 bg-usps-blue text-white rounded-xl text-sm font-semibold hover:bg-usps-blue-dark transition-colors"
+                  >
+                    Revenir à la fiche et réessayer
+                  </button>
+                ) : (
+                  <button
+                    onClick={retryJob}
+                    className="px-4 py-2.5 bg-usps-blue text-white rounded-xl text-sm font-semibold hover:bg-usps-blue-dark transition-colors"
+                  >
+                    Essayer un autre fichier
+                  </button>
+                )}
               </div>
             </div>
           )}
@@ -335,7 +358,7 @@ export default function UploadModal({ flow }: UploadModalProps) {
                       {aiEngineLabel(job.edited.processed_by)}
                     </div>
                   </div>
-                  <p className="text-sm text-gray-700">{job.edited.summary}</p>
+                  <p className="text-sm text-gray-700 whitespace-pre-line leading-relaxed max-h-56 overflow-y-auto">{job.edited.summary}</p>
                 </div>
 
                 {/* Register form */}
@@ -574,8 +597,13 @@ export default function UploadModal({ flow }: UploadModalProps) {
                 <button onClick={retryJob} className="flex-1 px-4 py-2.5 bg-gray-100 text-gray-700 rounded-xl text-sm font-medium hover:bg-gray-200 transition-colors">
                   Rescanner
                 </button>
-                <button onClick={handleSave} className="flex-1 px-4 py-2.5 bg-usps-blue text-white rounded-xl text-sm font-semibold shadow-sm hover:shadow-md transition-all">
-                  Enregistrer le document
+                <button
+                  onClick={handleSave}
+                  disabled={isSaving}
+                  className="flex-1 px-4 py-2.5 bg-usps-blue text-white rounded-xl text-sm font-semibold shadow-sm hover:shadow-md transition-all disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  {isSaving && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {isSaving ? 'Enregistrement...' : 'Enregistrer le document'}
                 </button>
               </div>
             </div>

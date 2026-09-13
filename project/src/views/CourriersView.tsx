@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+﻿import { useEffect, useState, useMemo } from 'react';
 import {
   Search,
   Filter,
@@ -7,6 +7,8 @@ import {
   ArrowDownLeft,
   ArrowUpRight as ArrowUp,
   AlertTriangle,
+  ChevronDown,
+  ScanLine,
 } from 'lucide-react';
 import { Avatar } from '@/components/Badges';
 import { formatDate } from '@/lib/format';
@@ -15,13 +17,20 @@ import { firestore } from '@/lib/firebase';
 import { compareNewestDocuments } from '@/lib/documentSort';
 import type { DocumentItem, DocumentStatus } from '@/lib/types';
 
+type Tab = 'all' | 'incoming' | 'outgoing' | 'unclassified';
+
 interface CourriersViewProps {
   documents: DocumentItem[];
   onSelectDocument: (doc: DocumentItem) => void;
+  onAnalyze: () => void;
   onDocumentsChange: () => void;
+  initialFilter?: {
+    direction?: Tab;
+    category?: string;
+    categories?: string[];
+    categoryLabel?: string;
+  };
 }
-
-type Tab = 'incoming' | 'outgoing' | 'unclassified';
 
 const STATUS_LABELS: Record<DocumentStatus, string> = {
   unread: 'Non lu',
@@ -37,14 +46,32 @@ const STATUS_STYLES: Record<DocumentStatus, string> = {
   archived: 'bg-ink-100 text-ink-500',
 };
 
-export function CourriersView({ documents, onSelectDocument, onDocumentsChange }: CourriersViewProps) {
-  const [tab, setTab] = useState<Tab>('incoming');
+export function CourriersView({ documents, onSelectDocument, onAnalyze, onDocumentsChange, initialFilter }: CourriersViewProps) {
+  const [tab, setTab] = useState<Tab>(initialFilter?.direction ?? 'incoming');
   const [search, setSearch] = useState('');
-  const [categoryFilter, setCategoryFilter] = useState('all');
+  const [categoryFilter, setCategoryFilter] = useState(initialFilter?.category ?? 'all');
+  const [categoryGroupFilter, setCategoryGroupFilter] = useState<string[]>(initialFilter?.categories ?? []);
+  const [categoryLabelOverride, setCategoryLabelOverride] = useState(initialFilter?.categoryLabel ?? '');
 
+  useEffect(() => {
+    if (!initialFilter || (!initialFilter.direction && !initialFilter.category && !initialFilter.categories?.length)) return;
+    setTab(initialFilter.direction ?? 'all');
+    setCategoryFilter(initialFilter.category ?? 'all');
+    setCategoryGroupFilter(initialFilter.categories ?? []);
+    setCategoryLabelOverride(initialFilter.categoryLabel ?? '');
+    setSearch('');
+  }, [initialFilter]);
+
+  const allCount = documents.length;
   const incomingCount = documents.filter((d) => d.direction === 'incoming').length;
   const outgoingCount = documents.filter((d) => d.direction === 'outgoing').length;
   const unclassifiedCount = documents.filter((d) => !d.direction).length;
+  const directionTabs: { id: Tab; label: string; count: number }[] = [
+    { id: 'all', label: 'Tous', count: allCount },
+    { id: 'incoming', label: 'Courriers entrants', count: incomingCount },
+    { id: 'outgoing', label: 'Courriers sortants', count: outgoingCount },
+    { id: 'unclassified', label: 'Non classés', count: unclassifiedCount },
+  ];
 
   const filtered = useMemo(() => {
     return documents.filter((doc) => {
@@ -61,10 +88,11 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
         )
           return false;
       }
-      if (categoryFilter !== 'all' && doc.category !== categoryFilter) return false;
+      if (categoryGroupFilter.length > 0 && !categoryGroupFilter.includes(doc.category)) return false;
+      if (categoryGroupFilter.length === 0 && categoryFilter !== 'all' && doc.category !== categoryFilter) return false;
       return true;
     }).sort(compareNewestDocuments);
-  }, [documents, tab, search, categoryFilter]);
+  }, [documents, tab, search, categoryFilter, categoryGroupFilter]);
 
   const categoryOptions = useMemo(() => [...new Set(documents.map((d) => d.category))].sort(), [documents]);
 
@@ -73,15 +101,51 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
     onDocumentsChange();
   };
 
-  const heading = tab === 'incoming' ? 'entrant' : tab === 'outgoing' ? 'sortant' : 'non classé';
-  const partyColumnLabel = tab === 'outgoing' ? 'Destinataire' : 'Expéditeur';
+  const selectedCategoryLabel = categoryLabelOverride || (categoryFilter === 'all' ? null : getCategoryMeta(categoryFilter).label);
+  const heading = selectedCategoryLabel
+    ? `- ${selectedCategoryLabel}`
+    : tab === 'all' ? 'global' : tab === 'incoming' ? 'entrant' : tab === 'outgoing' ? 'sortant' : 'non classé';
+  const partyColumnLabel = tab === 'outgoing' ? 'Destinataire' : tab === 'all' ? 'Exp. / Dest.' : 'Expéditeur';
 
   return (
-    <div className="p-6 space-y-5 animate-fade-in max-w-[1600px] mx-auto">
+    <div className="p-3 sm:p-6 space-y-5 animate-fade-in max-w-[1600px] mx-auto">
       {/* Tabs */}
-      <div className="flex items-center gap-2 bg-white rounded-2xl shadow-card border border-ink-200/60 p-2">
+      <div className="bg-white rounded-2xl shadow-card border border-ink-200/60 p-2">
+        <div className="relative md:hidden">
+          <label htmlFor="courrier-direction-filter" className="sr-only">Filtrer les courriers</label>
+          <select
+            id="courrier-direction-filter"
+            value={tab}
+            onChange={(event) => {
+              setTab(event.target.value as Tab);
+              setSearch('');
+              setCategoryFilter('all');
+              setCategoryGroupFilter([]);
+              setCategoryLabelOverride('');
+            }}
+            className="w-full appearance-none rounded-xl border border-ink-200 bg-white py-3 pl-3 pr-10 text-sm font-semibold text-ink-800 focus:border-primary-400 focus:outline-none focus:ring-2 focus:ring-primary-200"
+          >
+            {directionTabs.map((item) => <option key={item.id} value={item.id}>{item.label} ({item.count})</option>)}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-500" />
+        </div>
+        <div className="hidden items-center gap-2 md:flex">
         <button
-          onClick={() => { setTab('incoming'); setSearch(''); setCategoryFilter('all'); }}
+          onClick={() => { setTab('all'); setSearch(''); setCategoryFilter('all'); setCategoryGroupFilter([]); setCategoryLabelOverride(''); }}
+          className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
+            tab === 'all'
+              ? 'bg-gradient-to-r from-primary-600 to-primary-700 text-white shadow-lg shadow-primary-600/20'
+              : 'text-ink-600 hover:bg-ink-50'
+          }`}
+        >
+          <Inbox className="h-4 w-4" />
+          Tous
+          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${tab === 'all' ? 'bg-white/20' : 'bg-ink-100 text-ink-600'}`}>
+            {allCount}
+          </span>
+        </button>
+        <button
+          onClick={() => { setTab('incoming'); setSearch(''); setCategoryFilter('all'); setCategoryGroupFilter([]); setCategoryLabelOverride(''); }}
           className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
             tab === 'incoming'
               ? 'bg-gradient-to-r from-primary-600 to-primary-700 text-white shadow-lg shadow-primary-600/20'
@@ -95,7 +159,7 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
           </span>
         </button>
         <button
-          onClick={() => { setTab('outgoing'); setSearch(''); setCategoryFilter('all'); }}
+          onClick={() => { setTab('outgoing'); setSearch(''); setCategoryFilter('all'); setCategoryGroupFilter([]); setCategoryLabelOverride(''); }}
           className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
             tab === 'outgoing'
               ? 'bg-gradient-to-r from-primary-600 to-primary-700 text-white shadow-lg shadow-primary-600/20'
@@ -109,7 +173,7 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
           </span>
         </button>
         <button
-          onClick={() => { setTab('unclassified'); setSearch(''); setCategoryFilter('all'); }}
+          onClick={() => { setTab('unclassified'); setSearch(''); setCategoryFilter('all'); setCategoryGroupFilter([]); setCategoryLabelOverride(''); }}
           className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${
             tab === 'unclassified'
               ? 'bg-gradient-to-r from-warning-500 to-warning-600 text-white shadow-lg shadow-warning-600/20'
@@ -126,6 +190,7 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
             {unclassifiedCount}
           </span>
         </button>
+        </div>
       </div>
 
       {tab === 'unclassified' && unclassifiedCount > 0 && (
@@ -141,6 +206,14 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
       {/* Filters */}
       <div className="bg-white rounded-2xl shadow-card border border-ink-200/60 p-4">
         <div className="flex flex-col lg:flex-row items-stretch lg:items-center gap-3">
+          <button
+            type="button"
+            onClick={onAnalyze}
+            className="flex shrink-0 items-center justify-center gap-2 rounded-xl bg-primary-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-700"
+          >
+            <ScanLine className="h-4 w-4" />
+            Importer / scanner un document
+          </button>
           <div className="flex items-center gap-2 px-3 py-2 bg-ink-50 rounded-xl border border-ink-200 flex-1">
             <Search className="h-4 w-4 text-ink-400 shrink-0" />
             <input
@@ -155,7 +228,11 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
             <Filter className="h-3.5 w-3.5 text-ink-400" />
             <select
               value={categoryFilter}
-              onChange={(e) => setCategoryFilter(e.target.value)}
+              onChange={(e) => {
+                setCategoryFilter(e.target.value);
+                setCategoryGroupFilter([]);
+                setCategoryLabelOverride('');
+              }}
               className="text-xs font-medium text-ink-700 bg-transparent outline-none cursor-pointer"
             >
               <option value="all">Toutes les catégories</option>
@@ -194,7 +271,7 @@ export function CourriersView({ documents, onSelectDocument, onDocumentsChange }
             <tbody className="divide-y divide-ink-100">
               {filtered.map((doc) => {
                 const cat = getCategoryMeta(doc.category);
-                const party = tab === 'outgoing' ? (doc.register?.recipient || doc.sender) : doc.sender;
+                const party = doc.direction === 'outgoing' ? (doc.register?.recipient || doc.sender) : doc.sender;
                 const isUnclassified = !doc.direction;
                 return (
                   <tr

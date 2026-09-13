@@ -4,6 +4,7 @@ import OpenAI from 'openai';
 import cors from 'cors';
 import express from 'express';
 import admin from 'firebase-admin';
+import WordExtractor from 'word-extractor';
 
 const requiredEnvironment = ['FIREBASE_SERVICE_ACCOUNT'];
 const missingEnvironment = requiredEnvironment.filter((key) => !process.env[key]);
@@ -21,8 +22,9 @@ const claudeModel = process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest';
 
 const openaiClient = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
 const openaiModel = process.env.OPENAI_MODEL || 'gpt-4o';
+const wordExtractor = new WordExtractor();
 
-// Local Ollama instance (text-only, no vision) â€” a third alternative that keeps text-based
+// Local Ollama instance (text-only, no vision) — a third alternative that keeps text-based
 // analysis and chat working with a real LLM even when Claude and OpenAI are both unavailable
 // (out of credit, no key, rate-limited, etc). PDF/image reading still needs a vision model, so
 // it stays on Claude/OpenAI and falls through to the crude offline heuristic if both fail.
@@ -147,9 +149,9 @@ function isAllowedOrigin(origin) {
 app.use(cors({
   origin(origin, callback) {
     if (isAllowedOrigin(origin)) return callback(null, true);
-    return callback(new Error("L'origine n'est pas autorisÃ©e."));
+    return callback(new Error("L'origine n'est pas autorisée."));
   },
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Authorization', 'Content-Type'],
 }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '50mb' }));
@@ -162,9 +164,122 @@ async function requireFirebaseUser(req, res, next) {
     req.user = await admin.auth().verifyIdToken(token);
     return next();
   } catch {
-    return res.status(401).json({ error: 'Votre session est invalide ou a expirÃ©.' });
+    return res.status(401).json({ error: 'Votre session est invalide ou a expiré.' });
   }
 }
+
+async function findPrimaryAdminCompany(uid) {
+  const db = admin.firestore();
+  const profiles = await db.collection('profiles').where('owner_id', '==', uid).get();
+  for (const profileDoc of profiles.docs) {
+    const profile = profileDoc.data();
+    if (profile.role !== 'ORGANIZATION_ADMIN' || !profile.company_id) continue;
+    const companyId = String(profile.company_id);
+    const companyDoc = await db.collection('companies').doc(companyId).get();
+    const company = companyDoc.data();
+    if (companyDoc.exists && company?.primary_admin_uid === uid) {
+      return { db, id: companyId, name: text(company.name, 200) || 'votre entreprise', adminName: text(profile.full_name, 200) };
+    }
+  }
+  return null;
+}
+
+app.delete('/api/company/members/:memberUid', requireFirebaseUser, async (req, res, next) => {
+  try {
+    const requesterUid = req.user.uid;
+    const memberUid = text(req.params.memberUid, 128);
+    if (!memberUid || memberUid === requesterUid) {
+      return res.status(400).json({ error: 'Vous ne pouvez pas retirer votre propre compte.' });
+    }
+
+    const company = await findPrimaryAdminCompany(requesterUid);
+    if (!company) {
+      return res.status(403).json({ error: 'Seul l’administrateur principal de l’entreprise peut retirer un membre.' });
+    }
+
+    const targetProfiles = await company.db.collection('profiles')
+      .where('owner_id', '==', memberUid)
+      .where('company_id', '==', company.id)
+      .get();
+    if (targetProfiles.empty) {
+      return res.status(404).json({ error: 'Ce membre ne fait pas partie de votre entreprise.' });
+    }
+
+    const batch = company.db.batch();
+    targetProfiles.docs.forEach((profileDoc) => batch.delete(profileDoc.ref));
+    await batch.commit();
+    return res.json({ success: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.patch('/api/company/members/:memberUid/status', requireFirebaseUser, async (req, res, next) => {
+  try {
+    const requesterUid = req.user.uid;
+    const memberUid = text(req.params.memberUid, 128);
+    const suspended = req.body?.suspended;
+    if (!memberUid || memberUid === requesterUid || typeof suspended !== 'boolean') {
+      return res.status(400).json({ error: 'La demande de suspension est invalide.' });
+    }
+
+    const company = await findPrimaryAdminCompany(requesterUid);
+    if (!company) {
+      return res.status(403).json({ error: 'Seul l’administrateur principal de l’entreprise peut suspendre ou réactiver un membre.' });
+    }
+
+    const targetProfiles = await company.db.collection('profiles')
+      .where('owner_id', '==', memberUid)
+      .where('company_id', '==', company.id)
+      .get();
+    if (targetProfiles.empty) {
+      return res.status(404).json({ error: 'Ce membre ne fait pas partie de votre entreprise.' });
+    }
+
+    await admin.auth().updateUser(memberUid, { disabled: suspended });
+    if (suspended) await admin.auth().revokeRefreshTokens(memberUid);
+
+    const batch = company.db.batch();
+    const timestamp = new Date().toISOString();
+    targetProfiles.docs.forEach((profileDoc) => batch.update(profileDoc.ref, {
+      suspended,
+      suspended_at: suspended ? timestamp : null,
+      suspended_by: suspended ? requesterUid : null,
+      suspended_by_name: suspended ? company.adminName : null,
+      suspension_company_name: suspended ? company.name : null,
+      updated_at: timestamp,
+    }));
+    await batch.commit();
+    return res.json({ success: true, suspended });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.delete('/api/company/invitations/:invitationId', requireFirebaseUser, async (req, res, next) => {
+  try {
+    const company = await findPrimaryAdminCompany(req.user.uid);
+    if (!company) {
+      return res.status(403).json({ error: 'Seul l’administrateur principal peut supprimer une invitation.' });
+    }
+
+    const invitationId = text(req.params.invitationId, 128);
+    if (!invitationId) return res.status(400).json({ error: 'L’identifiant de l’invitation est invalide.' });
+    const invitationRef = company.db.collection('invitations').doc(invitationId);
+    const invitationDoc = await invitationRef.get();
+    if (!invitationDoc.exists || invitationDoc.data()?.company_id !== company.id) {
+      return res.status(404).json({ error: 'Cette invitation est introuvable dans votre entreprise.' });
+    }
+    if (invitationDoc.data()?.status === 'accepted') {
+      return res.status(409).json({ error: 'Une invitation déjà acceptée ne peut pas être supprimée.' });
+    }
+
+    await invitationRef.delete();
+    return res.json({ success: true });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 function text(value, limit = 120000) {
   return typeof value === 'string' ? value.trim().slice(0, limit) : '';
@@ -262,10 +377,10 @@ function normalizeAnalysis(value) {
   const analysis = value && typeof value === 'object' ? value : {};
   const category = documentCategories.has(analysis.category) ? analysis.category : 'Other';
   const confidence = Number(analysis.confidence);
-  const rawSummary = text(analysis.summary, 2000);
+  const rawSummary = text(analysis.summary, 6000);
   return {
     category,
-    summary: rawSummary && !looksLikeRawJson(rawSummary) ? rawSummary : 'Aucun rÃ©sumÃ© n\'a Ã©tÃ© gÃ©nÃ©rÃ©.',
+    summary: rawSummary && !looksLikeRawJson(rawSummary) ? rawSummary : 'Aucun résumé n\'a été généré.',
     documentType: text(analysis.documentType, 120) || localCategoryLabelsFr[category] || category,
     confidence: Number.isFinite(confidence) ? Math.min(1, Math.max(0, confidence)) : 0.5,
     issuer: text(analysis.issuer, 200) || null,
@@ -274,6 +389,7 @@ function normalizeAnalysis(value) {
     amount: Number.isFinite(Number(analysis.amount)) ? Number(analysis.amount) : null,
     currency: text(analysis.currency, 8) || 'USD',
     fields: analysis.fields && typeof analysis.fields === 'object' ? analysis.fields : {},
+    keyPoints: Array.isArray(analysis.keyPoints) ? analysis.keyPoints.map((item) => text(item, 500)).filter(Boolean).slice(0, 12) : [],
     tags: Array.isArray(analysis.tags) ? analysis.tags.map((item) => text(item, 60)).filter(Boolean).slice(0, 8) : [],
     keywords: Array.isArray(analysis.keywords) ? analysis.keywords.map((item) => text(item, 60)).filter(Boolean).slice(0, 12) : [],
     language: text(analysis.language, 8) || 'fr',
@@ -288,7 +404,7 @@ Set expirationDate only when the document explicitly identifies a valid expirati
 Return valid JSON only, without markdown, using exactly this shape:
 {
   "category": "Invoice|Medical Report|Bank Statement|Passport|Driver License|Tax|Insurance|Employment Contract|Birth Certificate|Receipt|Utility Bill|Academic|Legal|Other",
-  "summary": "string",
+  "summary": "string: detailed French summary, 2 to 5 short paragraphs or bullet-style sentences. Include the document purpose, parties involved, key facts, amounts, dates/deadlines, required actions, suggested service/responsible party, and risks or urgency when present.",
   "documentType": "string",
   "confidence": 0.0,
   "issuer": "string|null",
@@ -297,11 +413,12 @@ Return valid JSON only, without markdown, using exactly this shape:
   "amount": "number|null",
   "currency": "ISO 4217 currency code",
   "fields": { "key": "value" },
+  "keyPoints": ["string: 5 to 10 important facts, figures, decisions, risks, discrepancies, pending actions or recommendations explicitly supported by the document"],
   "tags": ["string"],
   "keywords": ["string"],
   "language": "ISO 639-1 language code"
 }
-Keep the summary concise and in French. Confidence must be between 0 and 1. Use null when a value is absent.`;
+Write an extended but practical French summary. It must be useful for a manager who has not read the document: explain what the document is about, who is involved, what is requested or decided, what amounts or deadlines matter, what action should happen next, and any risk or urgency. Use 2 to 5 short paragraphs or compact bullet-style sentences. Also return 5 to 10 concise keyPoints when the document contains enough information; include material figures, progress, variances, blockers, pending payments, expected funding, recommendations and follow-up periods. Never infer or invent facts. Confidence must be between 0 and 1. Use null when a value is absent.`;
 
 const pdfReadAndAnalyzeInstructions = `You are PapyDoc. Read the attached PDF exactly as a human would visually read it, page by page, including any scanned, photographed, or image-only pages that have no embedded text layer. Do not skip pages.
 Ignore QR codes, barcodes, and similar scannable codes: do not decode, transcribe, or describe their content anywhere in the output.
@@ -312,7 +429,7 @@ Return valid JSON only, without markdown, using exactly this shape, with "analys
 {
   "analysis": {
     "category": "Invoice|Medical Report|Bank Statement|Passport|Driver License|Tax|Insurance|Employment Contract|Birth Certificate|Receipt|Utility Bill|Academic|Legal|Other",
-    "summary": "string",
+    "summary": "string: detailed French summary, 2 to 5 short paragraphs or bullet-style sentences. Include the document purpose, parties involved, key facts, amounts, dates/deadlines, required actions, suggested service/responsible party, and risks or urgency when present.",
     "documentType": "string",
     "confidence": 0.0,
     "issuer": "string|null",
@@ -321,18 +438,49 @@ Return valid JSON only, without markdown, using exactly this shape, with "analys
     "amount": "number|null",
     "currency": "ISO 4217 currency code",
     "fields": { "key": "value" },
+    "keyPoints": ["string: 5 to 10 important facts, figures, decisions, risks, discrepancies, pending actions or recommendations explicitly supported by the document"],
     "tags": ["string"],
     "keywords": ["string"],
     "language": "ISO 639-1 language code"
   },
   "fullText": "the complete text you read from every page, in the document's original language and wording, with each page separated by a line reading \\"Page N\\""
 }
-Keep the summary concise and in French. Confidence must be between 0 and 1. Use null when a value is absent.
-Write "analysis" first and complete it fully before starting "fullText". This matters because long, multi-page documents (10+ pages, especially scanned ones) can exceed your output budget: if that happens, "analysis" must already be a complete, valid, useful JSON object â€” losing the tail end of "fullText" is acceptable, losing "analysis" is not. For very long documents, prioritize finishing valid JSON over transcribing every remaining page verbatim: if you are running low on space, wrap up "fullText" cleanly (even if it means summarizing or truncating the last pages with a note like "[... pages truncated ...]") rather than letting the response cut off mid-string.`;
+Write an extended but practical French summary. It must be useful for a manager who has not read the document: explain what the document is about, who is involved, what is requested or decided, what amounts or deadlines matter, what action should happen next, and any risk or urgency. Use 2 to 5 short paragraphs or compact bullet-style sentences. Also return 5 to 10 concise keyPoints when the document contains enough information; include material figures, progress, variances, blockers, pending payments, expected funding, recommendations and follow-up periods. Never infer or invent facts. Confidence must be between 0 and 1. Use null when a value is absent.
+Write "analysis" first and complete it fully before starting "fullText". This matters because long, multi-page documents (10+ pages, especially scanned ones) can exceed your output budget: if that happens, "analysis" must already be a complete, valid, useful JSON object — losing the tail end of "fullText" is acceptable, losing "analysis" is not. For very long documents, prioritize finishing valid JSON over transcribing every remaining page verbatim: if you are running low on space, wrap up "fullText" cleanly (even if it means summarizing or truncating the last pages with a note like "[... pages truncated ...]") rather than letting the response cut off mid-string.`;
 
 const visionOcrInstructions = 'You are PapyDoc OCR. Extract visible text from the supplied document page image. Return only the text you can read. Preserve names, numbers, dates, punctuation, line breaks, and original wording. Ignore QR codes, barcodes, and similar scannable codes: do not decode, transcribe, or describe their content. Do not summarize. Do not translate. If the page is not readable, return NO_READABLE_TEXT.';
 
-const chatInstructions = 'You are PapyDoc. Answer in French using only the supplied text. It may contain a single document, or several documents concatenated and each introduced by a "### Document N" heading with metadata (title, sender, category, amount, due date) followed by its full text â€” when there are several, search across all of them to answer questions that require comparing, counting, filtering, or aggregating across documents (e.g. "which document is due soonest", "how many invoices are from supplier X", "which documents relate to taxes"), and cite which document(s) support your answer by title when helpful. Do not translate or rewrite the original document text unless the user explicitly asks for a translation. If the answer is not in the supplied text, say so clearly rather than guessing.';
+const consolidationInstructions = `You are PapyDoc, consolidating several individual report summaries submitted by different contributors into ONE unified report.
+Each input is introduced by a "### Rapport N — <label>" heading followed by that contributor's summary and key points.
+Merge and harmonize the information: remove redundancy between contributors, reconcile figures and dates when they agree, explicitly flag any contradiction or discrepancy between contributors, and highlight what is missing or still pending.
+Write everything in French only.
+Return valid JSON only, without markdown, using exactly this shape:
+{
+  "summary": "string: a consolidated French synthesis, 3 to 6 short paragraphs or bullet-style sentences, that reads as a single coherent report built from all contributions",
+  "keyPoints": ["string: the most important facts, figures, decisions, risks or discrepancies across all contributions, each a short standalone sentence"]
+}
+Use null-safe defaults: if information is insufficient, say so plainly in the summary rather than inventing content.`;
+
+function normalizeConsolidation(value) {
+  const result = value && typeof value === 'object' ? value : {};
+  const summary = text(result.summary, 8000);
+  return {
+    summary: summary && !looksLikeRawJson(summary) ? summary : 'Aucune synthèse consolidée n\'a été générée.',
+    keyPoints: Array.isArray(result.keyPoints) ? result.keyPoints.map((item) => text(item, 300)).filter(Boolean).slice(0, 20) : [],
+  };
+}
+
+function reportsToCorpus(reports) {
+  return reports.map((report, i) => {
+    const label = text(report.label, 200) || `Contributeur ${i + 1}`;
+    const summary = text(report.summary, 6000);
+    const keyPoints = Array.isArray(report.keyPoints) ? report.keyPoints.map((item) => text(item, 300)).filter(Boolean) : [];
+    const keyPointsBlock = keyPoints.length ? `\nPoints clés:\n${keyPoints.map((k) => `- ${k}`).join('\n')}` : '';
+    return `### Rapport ${i + 1} — ${label}\n${summary}${keyPointsBlock}`;
+  }).join('\n\n');
+}
+
+const chatInstructions = 'You are PapyDoc. Answer in French using only the supplied text. It may contain a single document, or several documents concatenated and each introduced by a "### Document N" heading with metadata (title, sender, category, amount, due date) followed by its full text — when there are several, search across all of them to answer questions that require comparing, counting, filtering, or aggregating across documents (e.g. "which document is due soonest", "how many invoices are from supplier X", "which documents relate to taxes"), and cite which document(s) support your answer by title when helpful. Do not translate or rewrite the original document text unless the user explicitly asks for a translation. If the answer is not in the supplied text, say so clearly rather than guessing.';
 
 // ---- Local (offline, no external API) fallback engine ----
 // This never throws and never calls out to a third party. It is the final
@@ -357,17 +505,17 @@ const localCategoryKeywords = {
 
 const localCategoryLabelsFr = {
   'Invoice': 'Facture',
-  'Medical Report': 'Rapport mÃ©dical',
-  'Bank Statement': 'RelevÃ© bancaire',
+  'Medical Report': 'Rapport médical',
+  'Bank Statement': 'Relevé bancaire',
   'Passport': 'Passeport',
   'Driver License': 'Permis de conduire',
   'Tax': 'Document fiscal',
   'Insurance': 'Document d\'assurance',
   'Employment Contract': 'Contrat de travail',
   'Birth Certificate': 'Acte de naissance',
-  'Receipt': 'ReÃ§u',
+  'Receipt': 'Reçu',
   'Utility Bill': 'Facture de services publics',
-  'Academic': 'Document acadÃ©mique',
+  'Academic': 'Document académique',
   'Legal': 'Document juridique',
   'Other': 'Autre document',
 };
@@ -412,17 +560,30 @@ function localExtractDateNear(rawText, keywords) {
 function localAnalyzeText(rawText) {
   const lowerText = rawText.toLowerCase();
   const category = localCategorize(lowerText);
-  const firstLine = rawText.split('\n').map((line) => line.trim()).find(Boolean) || '';
+  const readableLines = rawText.split('\n').map((line) => line.trim()).filter(Boolean);
+  const firstLine = readableLines[0] || '';
+  const preview = readableLines.slice(0, 8).join(' ').slice(0, 900);
   const categoryLabelFr = localCategoryLabelsFr[category] || category;
+  const amount = localExtractAmount(rawText);
+  const issueDate = localExtractDateNear(rawText, ['issued', 'date:', 'dated']);
+  const expirationDate = localExtractDateNear(rawText, ['due', 'expire', 'expiration', 'deadline']);
   return {
     category,
-    summary: `Analyse hors ligne (les services d'IA Ã©taient indisponibles) : dÃ©tectÃ© comme ${categoryLabelFr}.${firstLine ? ` PremiÃ¨re ligne lue : "${firstLine.slice(0, 140)}"` : ''} Veuillez consulter le document original pour tous les dÃ©tails.`,
+    summary: [
+      `Analyse locale : ce document est détecté comme ${categoryLabelFr}.`,
+      firstLine ? `Objet probable : ${firstLine.slice(0, 180)}.` : null,
+      preview ? `Contenu repéré : ${preview}.` : null,
+      amount !== null ? `Montant détecté : ${amount.toFixed(2)} USD.` : 'Aucun montant précis n’a été détecté automatiquement.',
+      expirationDate ? `Échéance ou date limite détectée : ${expirationDate}.` : 'Aucune échéance certaine n’a été détectée automatiquement.',
+      issueDate ? `Date du document détectée : ${issueDate}.` : null,
+      'Action recommandée : vérifier le document original, confirmer les champs extraits, puis affecter le courrier au service responsable avant enregistrement.',
+    ].filter(Boolean).join('\n\n'),
     documentType: categoryLabelFr,
     confidence: 0.25,
     issuer: null,
-    issueDate: localExtractDateNear(rawText, ['issued', 'date:', 'dated']),
-    expirationDate: localExtractDateNear(rawText, ['due', 'expire', 'expiration', 'deadline']),
-    amount: localExtractAmount(rawText),
+    issueDate,
+    expirationDate,
+    amount,
     currency: 'USD',
     fields: {},
     tags: [],
@@ -436,7 +597,7 @@ function localAnalyzePdfOrImageFallback() {
     fullText: '',
     analysis: {
       category: 'Other',
-      summary: "La lecture automatique est temporairement indisponible (tous les moteurs d'IA ont Ã©chouÃ©). Veuillez ouvrir le document original et saisir les dÃ©tails manuellement.",
+      summary: "La lecture automatique est temporairement indisponible (tous les moteurs d'IA ont échoué). Veuillez ouvrir le document original et saisir les détails manuellement.",
       documentType: 'Document',
       confidence: 0,
       issuer: null,
@@ -457,16 +618,16 @@ function localChatAnswer(question, documentText) {
   if (q.includes('how much') || q.includes('amount') || q.includes('owe')) {
     const amount = localExtractAmount(documentText);
     return amount !== null
-      ? `D'aprÃ¨s une analyse hors ligne basique, le montant mentionnÃ© est de ${amount.toFixed(2)} $.`
-      : "Je n'ai trouvÃ© aucun montant prÃ©cis dans ce document.";
+      ? `D'après une analyse hors ligne basique, le montant mentionné est de ${amount.toFixed(2)} $.`
+      : "Je n'ai trouvé aucun montant précis dans ce document.";
   }
   if (q.includes('when') || q.includes('due') || q.includes('deadline') || q.includes('expire')) {
     const date = localExtractDateNear(documentText, ['due', 'expire', 'expiration', 'deadline']);
     return date
-      ? `D'aprÃ¨s une analyse hors ligne basique, la date concernÃ©e est le ${date}.`
-      : "Je n'ai trouvÃ© aucune date prÃ©cise dans ce document.";
+      ? `D'après une analyse hors ligne basique, la date concernée est le ${date}.`
+      : "Je n'ai trouvé aucune date précise dans ce document.";
   }
-  return "Les services d'IA sont temporairement indisponibles, je ne peux donc effectuer qu'une analyse hors ligne basique de ce document. Veuillez rÃ©essayer plus tard pour obtenir une rÃ©ponse complÃ¨te.";
+  return "Les services d'IA sont temporairement indisponibles, je ne peux donc effectuer qu'une analyse hors ligne basique de ce document. Veuillez réessayer plus tard pour obtenir une réponse complète.";
 }
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
@@ -512,6 +673,68 @@ app.post('/api/ai/analyze', requireFirebaseUser, async (req, res, next) => {
     ]);
 
     return res.json({ analysis, engine });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+app.post('/api/ai/analyze-word', requireFirebaseUser, async (req, res, next) => {
+  try {
+    const wordBase64 = text(req.body?.wordBase64, 45_000_000);
+    if (!wordBase64) return res.status(400).json({ error: 'Le document Word (wordBase64) est requis.' });
+
+    let wordDocument;
+    try {
+      wordDocument = await wordExtractor.extract(Buffer.from(wordBase64, 'base64'));
+    } catch {
+      return res.status(422).json({ error: 'Ce document Word est illisible ou endommagé.' });
+    }
+
+    const fullText = text([
+      wordDocument.getHeaders(),
+      wordDocument.getBody(),
+      wordDocument.getFootnotes(),
+      wordDocument.getEndnotes(),
+    ].filter(Boolean).join('\n\n'), 200_000);
+    const documentText = prepareAnalysisText(fullText);
+    if (!documentText) return res.status(422).json({ error: 'Aucun texte lisible n’a été trouvé dans ce document Word.' });
+
+    const { value: analysis, engine } = await runAiChain([
+      {
+        name: 'claude',
+        run: async () => {
+          if (!anthropic) throw new Error('Anthropic is not configured.');
+          const response = await anthropic.messages.create({
+            model: claudeModel,
+            max_tokens: 5000,
+            system: documentAnalysisInstructions,
+            messages: [{ role: 'user', content: `Document text:\n\n${documentText}` }],
+          });
+          return normalizeAnalysis(parseJsonResponse(extractText(response)));
+        },
+      },
+      {
+        name: 'openai',
+        run: async () => {
+          if (!openaiClient) throw new Error('OpenAI is not configured.');
+          const response = await openaiClient.chat.completions.create({
+            model: openaiModel,
+            max_tokens: 5000,
+            messages: [
+              { role: 'system', content: documentAnalysisInstructions },
+              { role: 'user', content: `Document text:\n\n${documentText}` },
+            ],
+          });
+          return normalizeAnalysis(parseJsonResponse(response.choices?.[0]?.message?.content));
+        },
+      },
+      {
+        name: 'local',
+        run: async () => runLocalTextAnalysis(documentText),
+      },
+    ]);
+
+    return res.json({ fullText, analysis, engine });
   } catch (error) {
     return next(error);
   }
@@ -641,13 +864,13 @@ app.post('/api/ai/vision-ocr', requireFirebaseUser, async (req, res, next) => {
 app.post('/api/ai/chat', requireFirebaseUser, async (req, res, next) => {
   try {
     const question = text(req.body?.question, 4000);
-    const documentText = text(req.body?.documentText);
+    const documentText = text(req.body?.documentText, Number(process.env.AI_CHAT_MAX_CHARS || 45000));
     const conversation = Array.isArray(req.body?.conversation) ? req.body.conversation.slice(-8) : [];
     if (!question || !documentText) {
       return res.status(400).json({ error: 'La question et le texte du document (documentText) sont requis.' });
     }
 
-    const { value: answer } = await runAiChain([
+    const { value: answer, engine } = await runAiChain([
       {
         name: 'claude',
         run: async () => {
@@ -661,7 +884,7 @@ app.post('/api/ai/chat', requireFirebaseUser, async (req, res, next) => {
               content: `Document text:\n${documentText}\n\nRecent conversation:\n${JSON.stringify(conversation)}\n\nUser question: ${question}`,
             }],
           });
-          return extractText(response) || "Je n'ai pas pu gÃ©nÃ©rer de rÃ©ponse.";
+          return extractText(response) || "Je n'ai pas pu générer de réponse.";
         },
       },
       {
@@ -679,7 +902,7 @@ app.post('/api/ai/chat', requireFirebaseUser, async (req, res, next) => {
               },
             ],
           });
-          return response.choices?.[0]?.message?.content?.trim() || "Je n'ai pas pu gÃ©nÃ©rer de rÃ©ponse.";
+          return response.choices?.[0]?.message?.content?.trim() || "Je n'ai pas pu générer de réponse.";
         },
       },
       {
@@ -694,6 +917,57 @@ app.post('/api/ai/chat', requireFirebaseUser, async (req, res, next) => {
   }
 });
 
+app.post('/api/ai/consolidate', requireFirebaseUser, async (req, res, next) => {
+  try {
+    const reports = Array.isArray(req.body?.reports) ? req.body.reports : [];
+    if (reports.length === 0) return res.status(400).json({ error: 'Au moins un rapport (reports) est requis.' });
+
+    const corpus = prepareAnalysisText(reportsToCorpus(reports));
+
+    const { value: consolidated, engine } = await runAiChain([
+      {
+        name: 'claude',
+        run: async () => {
+          if (!anthropic) throw new Error('Anthropic is not configured.');
+          const response = await anthropic.messages.create({
+            model: claudeModel,
+            max_tokens: 3000,
+            system: consolidationInstructions,
+            messages: [{ role: 'user', content: corpus }],
+          });
+          return normalizeConsolidation(parseJsonResponse(extractText(response)));
+        },
+      },
+      {
+        name: 'openai',
+        run: async () => {
+          if (!openaiClient) throw new Error('OpenAI is not configured.');
+          const response = await openaiClient.chat.completions.create({
+            model: openaiModel,
+            max_tokens: 3000,
+            messages: [
+              { role: 'system', content: consolidationInstructions },
+              { role: 'user', content: corpus },
+            ],
+          });
+          return normalizeConsolidation(parseJsonResponse(response.choices?.[0]?.message?.content));
+        },
+      },
+      {
+        name: 'local',
+        run: async () => ({
+          summary: reports.map((r, i) => `Rapport ${i + 1} (${text(r.label, 100) || 'Contributeur'}) : ${text(r.summary, 400)}`).join('\n\n'),
+          keyPoints: reports.flatMap((r) => (Array.isArray(r.keyPoints) ? r.keyPoints.slice(0, 3) : [])).map((item) => text(item, 300)).filter(Boolean).slice(0, 20),
+        }),
+      },
+    ]);
+
+    return res.json({ consolidated, engine });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 app.use((error, _req, res, _next) => {
   console.error(error);
   const status = error?.status || 500;
@@ -703,5 +977,3 @@ app.use((error, _req, res, _next) => {
 
 const port = Number(process.env.PORT || 3001);
 app.listen(port, () => console.log(`PapyDoc AI backend listening on port ${port}`));
-
-

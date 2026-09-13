@@ -66,8 +66,8 @@ export function DocumentDetail({ document: doc, onBack }: DocumentDetailProps) {
   return (
     <div className="animate-fade-in max-w-[1600px] mx-auto">
       {/* Sticky header */}
-      <div className="sticky top-16 z-20 bg-white/80 backdrop-blur-xl border-b border-ink-200/60 px-6 py-3">
-        <div className="flex items-center gap-4">
+      <div className="sticky top-12 sm:top-16 z-20 bg-white/80 backdrop-blur-xl border-b border-ink-200/60 px-3 sm:px-6 py-2 sm:py-3">
+        <div className="flex items-center gap-2 sm:gap-4">
           <button
             onClick={onBack}
             className="flex items-center gap-1.5 text-sm font-medium text-ink-600 hover:text-primary-600 transition-colors"
@@ -96,7 +96,7 @@ export function DocumentDetail({ document: doc, onBack }: DocumentDetailProps) {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6 p-6">
+      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4 sm:gap-6 p-3 sm:p-6">
         {/* Left: Document preview + AI analysis */}
         <div className="xl:col-span-2 space-y-6">
           {/* Document preview mock */}

@@ -1,19 +1,28 @@
-import { useMemo, useRef, useState } from 'react';
+﻿import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
-  ArrowLeft, Volume2, Square, Send, CalendarPlus, StickyNote,
+  ArrowLeft, Volume2, Square, Send, CalendarPlus, ChevronDown, StickyNote,
   MessageSquare, CheckSquare, Archive, Clock,
-  Sparkles, User, Trash2, Download, FileDown, Upload as UploadIcon, Share2, FileText,
-  X, ArrowDownLeft, ArrowUpRight, ClipboardList, AlertTriangle,
+  Sparkles, User, Trash2, Download, FileDown, Upload as UploadIcon, FileText,
+  X, ArrowDownLeft, ArrowUpRight, ClipboardList, AlertTriangle, Pencil, Save, Users, Lock, Check, ListPlus,
 } from 'lucide-react';
 import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
 import type { DocumentItem, Note, Comment, Reminder, ActionItem, Folder } from '@/lib/types';
 import { formatCurrency, formatDate, formatDateTime, relativeDeadline, relativeTime, priorityColor, priorityLabel, daysUntil, isRawJsonText } from '@/lib/format';
 import { getCategoryMeta } from '@/lib/categories';
 import { speak, stopSpeaking, isSpeechSupported } from '@/lib/speech';
-import { askDocumentQuestion, type AIAnswer } from '@/lib/ai';
-import { auth, firestore, storage } from '@/lib/firebase';
-import { frenchDocumentSender, frenchDocumentSummary, frenchDocumentTitle, frenchText } from '@/lib/frenchText';
+import { askDocumentQuestion, prepareFrenchReading, type AIAnswer } from '@/lib/ai';
+import { auth, firestore, getActiveCompanyContext, storage } from '@/lib/firebase';
+import { isTopRole } from '@/lib/documentAccess';
 import FolderPicker from './FolderPicker';
+import CreateTaskModal from './CreateTaskModal';
+
+interface CompanyMember {
+  owner_id: string;
+  company_id: string;
+  full_name: string;
+  email: string;
+  role_label: string;
+}
 
 interface DocumentDetailProps {
   document: DocumentItem;
@@ -22,6 +31,9 @@ interface DocumentDetailProps {
   reminders: Reminder[];
   actions: ActionItem[];
   folders: Folder[];
+  companyProfiles: CompanyMember[];
+  availableDocuments?: DocumentItem[];
+  canManageTrash?: boolean;
   onBack: () => void;
   onDataChange: () => void;
   onFoldersChange: () => void;
@@ -38,10 +50,24 @@ const STICKER_COLORS = [
   'bg-purple-100 border-purple-300',
 ];
 
+const INSTRUCTION_OPTIONS = ['À traiter', 'Répondre', 'Classer', 'Transmettre', 'Pour information', 'Autre'];
+const INCOMING_STATUS_OPTIONS = ['Reçu', 'En traitement', 'Traité', 'Répondu', 'Classé'];
+const OUTGOING_STATUS_OPTIONS = ['Préparé', 'Envoyé', 'Délivré', 'Clôturé'];
+
+function toDateInputValue(value?: string | null): string {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value.slice(0, 10);
+  return date.toISOString().slice(0, 10);
+}
+
 export default function DocumentDetail({
-  document: doc, notes, comments, reminders, actions, folders, onBack, onDataChange, onFoldersChange,
+  document: doc, notes, comments, reminders, actions, folders, companyProfiles, availableDocuments = [], canManageTrash = false, onBack, onDataChange, onFoldersChange,
 }: DocumentDetailProps) {
   const [tab, setTab] = useState<Tab>('summary');
+  const [showSharePicker, setShowSharePicker] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [showCreateTask, setShowCreateTask] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [question, setQuestion] = useState('');
   const [qaHistory, setQaHistory] = useState<AIAnswer[]>([]);
@@ -54,11 +80,26 @@ export default function DocumentDetail({
   const [newActionAssignee, setNewActionAssignee] = useState('');
   const [addingNote, setAddingNote] = useState(false);
   const [addingComment, setAddingComment] = useState(false);
-  const [showShareMenu, setShowShareMenu] = useState(false);
   const [readFull, setReadFull] = useState(false);
   const [readSummary, setReadSummary] = useState(false);
+  const [preparingReading, setPreparingReading] = useState(false);
   const [uploadingOriginal, setUploadingOriginal] = useState(false);
+  const [editingRegister, setEditingRegister] = useState(false);
+  const [savingRegister, setSavingRegister] = useState(false);
+  const [registerDraft, setRegisterDraft] = useState(doc.register);
+  const [senderDraft, setSenderDraft] = useState(doc.sender);
+  const [receivedDateDraft, setReceivedDateDraft] = useState(toDateInputValue(doc.received_date));
+  const [dueDateDraft, setDueDateDraft] = useState(toDateInputValue(doc.due_date));
   const originalFileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    setRegisterDraft(doc.register);
+    setSenderDraft(doc.sender);
+    setReceivedDateDraft(toDateInputValue(doc.received_date));
+    setDueDateDraft(toDateInputValue(doc.due_date));
+    setEditingRegister(false);
+    setSavingRegister(false);
+  }, [doc]);
 
   const registerRows = useMemo(() => {
     const r = doc.register;
@@ -98,46 +139,55 @@ export default function DocumentDetail({
   }, [doc]);
 
   const cat = getCategoryMeta(doc.category);
+  const activeCompanyId = getActiveCompanyContext()?.id;
+  const shareableCompanyProfiles = companyProfiles.filter((member) =>
+    Boolean(activeCompanyId) && member.company_id === activeCompanyId && member.owner_id !== auth.currentUser?.uid,
+  );
+  const sharedCompanyMemberIds = (doc.shared_with ?? []).filter((id) => shareableCompanyProfiles.some((member) => member.owner_id === id));
   const days = daysUntil(doc.due_date);
   const safeSummary = doc.summary && !isRawJsonText(doc.summary) ? doc.summary : 'Aucun résumé disponible.';
-  const speakableTitle = frenchDocumentTitle(doc);
-  const speakableSender = frenchDocumentSender(doc);
-  const speakableSummary = frenchText(safeSummary || frenchDocumentSummary(doc));
   const processedByLabel = doc.processed_by === 'claude' ? 'Claude AI'
     : doc.processed_by === 'openai' ? 'OpenAI'
     : doc.processed_by === 'local' ? 'IA locale'
     : null;
 
-  const handleSpeak = () => {
+  const handleSpeak = async () => {
     if (isPlaying) {
       stopSpeaking();
       setIsPlaying(false);
     } else {
-      const text = `${speakableTitle}. De ${speakableSender}. ${speakableSummary} ${frenchText(doc.content_text)}`;
+      setPreparingReading(true);
+      const text = await prepareFrenchReading(doc, 'summary');
+      setPreparingReading(false);
       speak(text, () => setIsPlaying(false));
       setIsPlaying(true);
     }
   };
 
-  const handleSpeakSummary = () => {
+  const handleSpeakSummary = async () => {
     if (isPlaying) {
       stopSpeaking();
       setIsPlaying(false);
       return;
     }
-    speak(speakableSummary, () => setIsPlaying(false));
+    setPreparingReading(true);
+    const text = await prepareFrenchReading(doc, 'summary');
+    setPreparingReading(false);
+    speak(text, () => setIsPlaying(false));
     setIsPlaying(true);
     setReadSummary(true);
     setTimeout(() => setReadSummary(false), 2000);
   };
 
-  const handleSpeakFull = () => {
+  const handleSpeakFull = async () => {
     if (isPlaying) {
       stopSpeaking();
       setIsPlaying(false);
       return;
     }
-    const text = `Texte complet de ${speakableTitle}. De ${speakableSender}. ${frenchText(doc.content_text)}`;
+    setPreparingReading(true);
+    const text = await prepareFrenchReading(doc, 'full');
+    setPreparingReading(false);
     speak(text, () => setIsPlaying(false));
     setIsPlaying(true);
     setReadFull(true);
@@ -181,7 +231,10 @@ export default function DocumentDetail({
     if (!file || !auth.currentUser) return;
     setUploadingOriginal(true);
     try {
-      const path = `users/${auth.currentUser.uid}/documents/${Date.now()}-${file.name}`;
+      const company = getActiveCompanyContext();
+      const path = company
+        ? `companies/${company.id}/documents/${Date.now()}-${file.name}`
+        : `users/${auth.currentUser.uid}/documents/${Date.now()}-${file.name}`;
       const uploaded = await uploadBytes(storageRef(storage, path), file);
       const url = await getDownloadURL(uploaded.ref);
       await firestore.from('documents').update({ image_url: url }).eq('id', doc.id);
@@ -198,17 +251,6 @@ export default function DocumentDetail({
 
   const handleFolderCreated = (_folder: Folder) => {
     onFoldersChange();
-  };
-
-  const handleShare = () => {
-    const shareUrl = `${window.location.origin}/?doc=${doc.id}`;
-    if (navigator.share) {
-      navigator.share({ title: doc.title, text: safeSummary, url: shareUrl }).catch(() => {});
-    } else {
-      navigator.clipboard?.writeText(shareUrl);
-      setShowShareMenu(true);
-      setTimeout(() => setShowShareMenu(false), 2000);
-    }
   };
 
   const handleAsk = async () => {
@@ -300,13 +342,56 @@ export default function DocumentDetail({
     onDataChange();
   };
 
+  const toggleShare = async (userId: string) => {
+    if (!shareableCompanyProfiles.some((member) => member.owner_id === userId)) return;
+    const allowedMemberIds = new Set(shareableCompanyProfiles.map((member) => member.owner_id));
+    const current = (doc.shared_with ?? []).filter((id) => allowedMemberIds.has(id));
+    const next = current.includes(userId) ? current.filter((id) => id !== userId) : [...current, userId];
+    setSharing(true);
+    await firestore.from('documents').update({ shared_with: next }).eq('id', doc.id);
+    setSharing(false);
+    onDataChange();
+  };
+
   const handleArchive = async () => {
     await firestore.from('documents').update({ status: 'archived' }).eq('id', doc.id);
     onBack();
   };
 
+  const handleMoveToTrash = async () => {
+    if (!canManageTrash) return;
+    await firestore.from('documents').update({ deleted_at: new Date().toISOString(), deleted_by: auth.currentUser?.uid ?? null }).eq('id', doc.id);
+    onBack();
+  };
+
   const handleMarkRead = async () => {
     await firestore.from('documents').update({ status: 'read' }).eq('id', doc.id);
+    onDataChange();
+  };
+
+  const updateRegisterDraft = (patch: Partial<NonNullable<DocumentItem['register']>>) => {
+    setRegisterDraft((current) => ({ ...(current ?? {}), ...patch } as NonNullable<DocumentItem['register']>));
+  };
+
+  const cancelRegisterEdit = () => {
+    setRegisterDraft(doc.register);
+    setSenderDraft(doc.sender);
+    setReceivedDateDraft(toDateInputValue(doc.received_date));
+    setDueDateDraft(toDateInputValue(doc.due_date));
+    setEditingRegister(false);
+  };
+
+  const saveRegisterEdit = async () => {
+    if (!registerDraft) return;
+    setSavingRegister(true);
+    await firestore.from('documents').update({
+      sender: senderDraft,
+      received_date: receivedDateDraft ? new Date(receivedDateDraft).toISOString() : doc.received_date,
+      due_date: dueDateDraft || null,
+      register: registerDraft,
+    }).eq('id', doc.id);
+    setSavingRegister(false);
+    setEditingRegister(false);
     onDataChange();
   };
 
@@ -327,20 +412,20 @@ export default function DocumentDetail({
   ];
 
   return (
-    <div className="flex flex-col h-screen">
+    <div className="flex flex-col min-h-[calc(100vh-3rem)] sm:min-h-[calc(100vh-4rem)]">
       {/* Header */}
-      <div className="border-b border-gray-100 bg-white px-6 lg:px-8 py-4 sticky top-0 z-10">
-        <div className="flex items-center justify-between gap-4 mb-3">
+      <div className="border-b border-gray-100 bg-white px-3 sm:px-6 lg:px-8 py-2 sm:py-4 sticky top-0 z-10">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-4 mb-2 sm:mb-3">
           <button
             onClick={onBack}
-            className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-900 transition-colors"
+            className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-900 transition-colors shrink-0"
           >
             <ArrowLeft className="w-4 h-4" />
             Retour
           </button>
 
           {/* Action Buttons */}
-          <div className="flex items-center gap-2 flex-wrap">
+          <div className="hidden">
             <button
               onClick={handleSpeakSummary}
               className={`px-3 py-1.5 text-sm rounded-lg transition-colors flex items-center gap-1.5 font-medium ${
@@ -348,7 +433,7 @@ export default function DocumentDetail({
               }`}
             >
               <Sparkles className="w-4 h-4" />
-              Lire le résumé
+              {preparingReading ? 'Préparation...' : 'Lire le résumé'}
             </button>
             <button
               onClick={handleSpeakFull}
@@ -357,7 +442,7 @@ export default function DocumentDetail({
               }`}
             >
               <FileText className="w-4 h-4" />
-              Lire le texte complet
+              {preparingReading ? 'Préparation...' : 'Lire le texte complet'}
             </button>
             <button
               onClick={handleDownload}
@@ -367,21 +452,28 @@ export default function DocumentDetail({
               Télécharger le texte
             </button>
 
-            {/* Share */}
-            <div className="relative">
-              <button
-                onClick={handleShare}
-                className="px-3 py-1.5 text-sm text-gray-600 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors flex items-center gap-1.5"
-              >
-                <Share2 className="w-4 h-4" />
-                Partager
-              </button>
-              {showShareMenu && (
-                <div className="absolute right-0 top-full mt-1 px-3 py-1.5 bg-gray-900 text-white text-xs rounded-lg whitespace-nowrap z-20">
-                  Lien copié !
-                </div>
+            {/* Partage interne avec les membres de l'entreprise */}
+            <button
+              onClick={() => setShowSharePicker(true)}
+              className={`px-3 py-1.5 text-sm rounded-lg transition-colors flex items-center gap-1.5 font-medium ${
+                (doc.shared_with?.length ?? 0) > 0 ? 'bg-primary-50 text-primary-700 hover:bg-primary-100' : 'bg-gray-50 text-gray-600 hover:bg-gray-100'
+              }`}
+            >
+              <Users className="w-4 h-4" />
+              Partager
+              {(doc.shared_with?.length ?? 0) > 0 && (
+                <span className="px-1.5 py-0.5 bg-white/60 rounded-full text-[10px] font-bold">{doc.shared_with?.length}</span>
               )}
-            </div>
+            </button>
+
+            {/* Créer une tâche liée à ce document */}
+            <button
+              onClick={() => setShowCreateTask(true)}
+              className="px-3 py-1.5 text-sm text-gray-600 bg-amber-50 hover:bg-amber-100 rounded-lg transition-colors flex items-center gap-1.5"
+            >
+              <ListPlus className="w-4 h-4" />
+              Créer une tâche
+            </button>
 
             {/* Add Note */}
             <button
@@ -404,6 +496,11 @@ export default function DocumentDetail({
                 Archiver
               </button>
             )}
+            {canManageTrash && (
+              <button onClick={handleMoveToTrash} className="px-3 py-1.5 text-sm text-danger-700 bg-danger-50 hover:bg-danger-100 rounded-lg transition-colors flex items-center gap-1.5">
+                <Trash2 className="w-4 h-4" /> Supprimer
+              </button>
+            )}
             {isSpeechSupported() && (
               <button
                 onClick={handleSpeak}
@@ -414,19 +511,19 @@ export default function DocumentDetail({
                 }`}
               >
                 {isPlaying ? <Square className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                {isPlaying ? 'Arrêter' : 'Écouter'}
+                {preparingReading ? 'Préparation...' : isPlaying ? 'Arrêter' : 'Écouter'}
               </button>
             )}
           </div>
         </div>
 
-        <div className="flex items-start gap-4">
-          <div className={`w-14 h-14 rounded-2xl ${cat.bgColor} flex items-center justify-center flex-shrink-0`}>
-            <cat.icon className={`w-7 h-7 ${cat.color}`} />
+        <div className="flex items-start gap-2 sm:gap-4">
+          <div className={`w-10 h-10 sm:w-14 sm:h-14 rounded-xl sm:rounded-2xl ${cat.bgColor} flex items-center justify-center flex-shrink-0`}>
+            <cat.icon className={`w-5 h-5 sm:w-7 sm:h-7 ${cat.color}`} />
           </div>
           <div className="flex-1 min-w-0">
-            <h1 className="text-xl font-bold text-gray-900 mb-1">{doc.title}</h1>
-            <div className="flex flex-wrap items-center gap-2 text-sm">
+            <h1 className="text-base sm:text-xl font-bold text-gray-900 mb-1 line-clamp-2">{doc.title}</h1>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs sm:text-sm">
               <span className="text-gray-500">{doc.sender}</span>
               <span className="text-gray-300">•</span>
               <span className={cat.color}>{cat.label}</span>
@@ -447,21 +544,30 @@ export default function DocumentDetail({
                 {!doc.direction ? <AlertTriangle className="w-3 h-3" /> : doc.direction === 'outgoing' ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownLeft className="w-3 h-3" />}
                 {!doc.direction ? 'Non classé' : doc.direction === 'outgoing' ? 'Sortant' : 'Entrant'}
               </button>
+              {isTopRole(doc.owner_role) && (
+                <span
+                  title="Visible uniquement par la Direction Générale et l'Administrateur, sauf partage explicite"
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-danger-50 text-danger-700"
+                >
+                  <Lock className="w-3 h-3" />
+                  Visibilité restreinte
+                </span>
+              )}
             </div>
           </div>
         </div>
 
         {/* Key Info Bar */}
-        {(doc.amount_due !== null || doc.due_date) && (
-          <div className="flex flex-wrap gap-3 mt-4">
-            {doc.amount_due !== null && (
-              <div className="px-4 py-2.5 rounded-xl bg-amber-50 border border-amber-100">
+        {((doc.amount_due !== null && doc.amount_due !== 0) || doc.due_date) && (
+          <div className="flex flex-wrap gap-2 sm:gap-3 mt-2 sm:mt-4">
+            {doc.amount_due !== null && doc.amount_due !== 0 && (
+              <div className="px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl bg-amber-50 border border-amber-100">
                 <div className="text-xs text-amber-600 font-medium mb-0.5">Montant dû</div>
                 <div className="text-lg font-bold text-amber-900">{formatCurrency(doc.amount_due, doc.currency)}</div>
               </div>
             )}
             {doc.due_date && (
-              <div className={`px-4 py-2.5 rounded-xl border ${days !== null && days <= 3 ? 'bg-red-50 border-red-100' : 'bg-gray-50 border-gray-100'}`}>
+              <div className={`px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl border ${days !== null && days <= 3 ? 'bg-red-50 border-red-100' : 'bg-gray-50 border-gray-100'}`}>
                 <div className={`text-xs font-medium mb-0.5 ${days !== null && days <= 3 ? 'text-usps-red' : 'text-gray-500'}`}>Date d'échéance</div>
                 <div className={`text-lg font-bold ${days !== null && days <= 3 ? 'text-red-900' : 'text-gray-900'}`}>
                   {formatDate(doc.due_date)}
@@ -469,7 +575,7 @@ export default function DocumentDetail({
                 <div className={`text-xs ${days !== null && days <= 3 ? 'text-usps-red' : 'text-gray-500'}`}>{relativeDeadline(doc.due_date)}</div>
               </div>
             )}
-            <div className={`px-4 py-2.5 rounded-xl border ${priorityColor(doc.priority)}`}>
+            <div className={`px-3 py-2 sm:px-4 sm:py-2.5 rounded-xl border ${priorityColor(doc.priority)}`}>
               <div className="text-xs font-medium opacity-70 mb-0.5">Priorité</div>
               <div className="text-lg font-bold">{priorityLabel(doc.priority)}</div>
             </div>
@@ -478,8 +584,24 @@ export default function DocumentDetail({
       </div>
 
       {/* Tabs */}
-      <div className="border-b border-gray-100 bg-white px-6 lg:px-8">
-        <div className="flex gap-1 overflow-x-auto">
+      <div className="border-b border-gray-100 bg-white px-3 sm:px-6 lg:px-8">
+        <div className="relative py-2 sm:hidden">
+          <label htmlFor="document-detail-section" className="sr-only">Section du document</label>
+          <select
+            id="document-detail-section"
+            value={tab}
+            onChange={(event) => setTab(event.target.value as Tab)}
+            className="w-full appearance-none rounded-lg border border-gray-200 bg-white py-2.5 pl-3 pr-10 text-sm font-semibold text-gray-800 focus:border-usps-blue focus:outline-none focus:ring-2 focus:ring-usps-blue/20"
+          >
+            {tabs.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.label}{item.count ? ` (${item.count})` : ''}
+              </option>
+            ))}
+          </select>
+          <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-gray-500" />
+        </div>
+        <div className="hidden gap-1 overflow-x-auto sm:flex">
           {tabs.map((t) => (
             <button
               key={t.id}
@@ -518,19 +640,6 @@ export default function DocumentDetail({
                     </div>
                     <p className="text-gray-700 leading-relaxed mb-4">{safeSummary}</p>
                     <div className="flex flex-wrap items-center gap-2">
-                      {isSpeechSupported() && (
-                        <button
-                          onClick={handleSpeakSummary}
-                          className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
-                            isPlaying
-                              ? 'bg-usps-red text-white hover:bg-usps-red-dark'
-                              : 'bg-usps-blue text-white hover:bg-usps-blue-dark'
-                          }`}
-                        >
-                          {isPlaying ? <Square className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                          {isPlaying ? 'Arrêter' : 'Lire à voix haute'}
-                        </button>
-                      )}
                       <FolderPicker
                         folders={folders}
                         selectedFolderId={doc.folder_id}
@@ -557,6 +666,34 @@ export default function DocumentDetail({
                           {uploadingOriginal ? 'Téléchargement...' : 'Importer l\'original'}
                         </button>
                       )}
+                      <details className="relative group">
+                        <summary className="flex min-h-9 list-none cursor-pointer items-center justify-between gap-2 rounded-lg border border-primary-200 bg-white px-3 py-1.5 text-sm font-medium text-primary-700 hover:bg-primary-50">
+                          <span className="flex items-center gap-1.5">
+                            <Users className="h-4 w-4" />Partager
+                            {sharedCompanyMemberIds.length > 0 && <span className="rounded-full bg-primary-100 px-1.5 py-0.5 text-[10px] font-bold">{sharedCompanyMemberIds.length}</span>}
+                          </span>
+                          <ChevronDown className="h-4 w-4 shrink-0 transition-transform group-open:rotate-180" />
+                        </summary>
+                        <div className="absolute left-0 top-full z-30 mt-1 max-h-56 w-72 max-w-[calc(100vw-3rem)] overflow-y-auto rounded-xl border border-ink-200 bg-white p-1.5 shadow-xl">
+                          {shareableCompanyProfiles.map((member) => {
+                            const checked = sharedCompanyMemberIds.includes(member.owner_id);
+                            return (
+                              <label key={member.owner_id} className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-2 text-xs text-ink-700 hover:bg-primary-50">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  disabled={sharing}
+                                  onChange={() => toggleShare(member.owner_id)}
+                                  className="accent-primary-600"
+                                />
+                                <span className="min-w-0 flex-1 truncate">{member.full_name || member.email} · {member.role_label}</span>
+                                {checked && <Check className="h-3.5 w-3.5 shrink-0 text-primary-600" />}
+                              </label>
+                            );
+                          })}
+                          {shareableCompanyProfiles.length === 0 && <p className="px-2 py-2 text-xs text-ink-400">Aucun autre membre dans votre entreprise.</p>}
+                        </div>
+                      </details>
                       <input
                         ref={originalFileInputRef}
                         type="file"
@@ -572,18 +709,97 @@ export default function DocumentDetail({
 
                   {registerRows.length > 0 && (
                     <div>
-                      <h3 className="font-semibold text-gray-900 mb-3 flex items-center gap-2">
-                        <ClipboardList className="w-4 h-4 text-usps-blue" />
-                        Registre du courrier {doc.direction === 'outgoing' ? 'départ' : 'arrivée'}
-                      </h3>
-                      <div className="p-5 rounded-2xl bg-white border border-gray-100 shadow-sm grid sm:grid-cols-2 gap-4">
-                        {registerRows.map((row) => (
-                          <div key={row.label}>
-                            <div className="text-xs text-gray-400 font-medium uppercase mb-0.5">{row.label}</div>
-                            <div className="text-sm font-medium text-gray-800">{row.value}</div>
+                      <div className="flex items-center justify-between gap-3 mb-3">
+                        <h3 className="font-semibold text-gray-900 flex items-center gap-2">
+                          <ClipboardList className="w-4 h-4 text-usps-blue" />
+                          Registre du courrier {doc.direction === 'outgoing' ? 'départ' : 'arrivée'}
+                        </h3>
+                        {!editingRegister ? (
+                          <button
+                            onClick={() => setEditingRegister(true)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-usps-gray text-usps-blue text-xs font-semibold hover:bg-blue-100 transition-colors"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                            Modifier
+                          </button>
+                        ) : (
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={cancelRegisterEdit}
+                              className="px-3 py-1.5 rounded-lg bg-gray-100 text-gray-600 text-xs font-semibold hover:bg-gray-200 transition-colors"
+                            >
+                              Annuler
+                            </button>
+                            <button
+                              onClick={saveRegisterEdit}
+                              disabled={savingRegister}
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-usps-blue text-white text-xs font-semibold hover:bg-usps-blue-dark disabled:opacity-50 transition-colors"
+                            >
+                              <Save className="w-3.5 h-3.5" />
+                              {savingRegister ? 'Enregistrement...' : 'Enregistrer'}
+                            </button>
                           </div>
-                        ))}
+                        )}
                       </div>
+
+                      {!editingRegister ? (
+                        <div className="p-5 rounded-2xl bg-white border border-gray-100 shadow-sm grid sm:grid-cols-2 gap-4">
+                          {registerRows.map((row) => (
+                            <div key={row.label}>
+                              <div className="text-xs text-gray-400 font-medium uppercase mb-0.5">{row.label}</div>
+                              <div className="text-sm font-medium text-gray-800">{row.value}</div>
+                            </div>
+                          ))}
+                        </div>
+                      ) : registerDraft ? (
+                        <div className="p-5 rounded-2xl bg-white border border-gray-100 shadow-sm grid sm:grid-cols-2 gap-4">
+                          <EditField label={doc.direction === 'outgoing' ? "N° d'ordre / numéro de sortie" : "N° d'enregistrement"}>
+                            <input value={registerDraft.registrationNumber || ''} onChange={(e) => updateRegisterDraft({ registrationNumber: e.target.value })} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                          </EditField>
+                          <EditField label={doc.direction === 'outgoing' ? "Date d'expédition" : 'Date de réception'}>
+                            <input type="date" value={receivedDateDraft} onChange={(e) => setReceivedDateDraft(e.target.value)} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                          </EditField>
+                          <EditField label={doc.direction === 'outgoing' ? 'Référence du courrier' : 'N° / Référence du courrier'}>
+                            <input value={registerDraft.referenceNumber || ''} onChange={(e) => updateRegisterDraft({ referenceNumber: e.target.value })} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                          </EditField>
+                          {doc.direction === 'incoming' && (
+                            <EditField label="Date du courrier">
+                              <input type="date" value={toDateInputValue(registerDraft.documentDate)} onChange={(e) => updateRegisterDraft({ documentDate: e.target.value || null })} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                            </EditField>
+                          )}
+                          <EditField label={doc.direction === 'outgoing' ? 'Destinataire' : 'Expéditeur / Provenance'}>
+                            <input value={doc.direction === 'outgoing' ? registerDraft.recipient || '' : senderDraft} onChange={(e) => (doc.direction === 'outgoing' ? updateRegisterDraft({ recipient: e.target.value }) : setSenderDraft(e.target.value))} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                          </EditField>
+                          {doc.direction === 'incoming' && (
+                            <EditField label="Destinataire">
+                              <input value={registerDraft.recipient || ''} onChange={(e) => updateRegisterDraft({ recipient: e.target.value })} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                            </EditField>
+                          )}
+                          <EditField label={doc.direction === 'outgoing' ? 'Service émetteur' : "Service d'affectation"}>
+                            <input value={registerDraft.assignedService || ''} onChange={(e) => updateRegisterDraft({ assignedService: e.target.value })} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                          </EditField>
+                          {doc.direction === 'incoming' && (
+                            <EditField label="Instruction / Imputation">
+                              <select value={registerDraft.instruction || ''} onChange={(e) => updateRegisterDraft({ instruction: e.target.value })} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none">
+                                {INSTRUCTION_OPTIONS.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                              </select>
+                            </EditField>
+                          )}
+                          {doc.direction === 'incoming' && (
+                            <EditField label="Échéance">
+                              <input type="date" value={dueDateDraft} onChange={(e) => setDueDateDraft(e.target.value)} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none" />
+                            </EditField>
+                          )}
+                          <EditField label="Statut">
+                            <select value={registerDraft.registerStatus || ''} onChange={(e) => updateRegisterDraft({ registerStatus: e.target.value })} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none">
+                              {(doc.direction === 'outgoing' ? OUTGOING_STATUS_OPTIONS : INCOMING_STATUS_OPTIONS).map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                            </select>
+                          </EditField>
+                          <EditField label="Observations">
+                            <textarea value={registerDraft.observations || ''} onChange={(e) => updateRegisterDraft({ observations: e.target.value })} rows={2} className="w-full bg-transparent text-sm font-semibold text-gray-900 outline-none resize-none" />
+                          </EditField>
+                        </div>
+                      ) : null}
                     </div>
                   )}
 
@@ -840,6 +1056,47 @@ export default function DocumentDetail({
               {/* Actions Tab */}
               {tab === 'actions' && (
                 <div className="space-y-4">
+                  <section className="rounded-xl border border-gray-100 bg-white p-4 shadow-sm">
+                    <h3 className="mb-3 text-sm font-semibold text-gray-900">Actions sur le document</h3>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                      <button onClick={handleSpeakSummary} className="flex items-center gap-2 rounded-lg border border-primary-100 bg-primary-50 px-3 py-2.5 text-left text-sm font-medium text-primary-700 hover:bg-primary-100">
+                        <Sparkles className="h-4 w-4 shrink-0" />Lire le résumé
+                      </button>
+                      <button onClick={handleSpeakFull} className="flex items-center gap-2 rounded-lg border border-primary-100 bg-primary-50 px-3 py-2.5 text-left text-sm font-medium text-primary-700 hover:bg-primary-100">
+                        <FileText className="h-4 w-4 shrink-0" />Lire le texte complet
+                      </button>
+                      <button onClick={handleDownload} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-left text-sm font-medium text-gray-700 hover:bg-gray-100">
+                        <Download className="h-4 w-4 shrink-0" />Télécharger le texte
+                      </button>
+                      <button onClick={() => setShowCreateTask(true)} className="flex items-center gap-2 rounded-lg border border-amber-100 bg-amber-50 px-3 py-2.5 text-left text-sm font-medium text-amber-800 hover:bg-amber-100">
+                        <ListPlus className="h-4 w-4 shrink-0" />Créer une tâche
+                      </button>
+                      <button onClick={() => setTab('notes')} className="flex items-center gap-2 rounded-lg border border-amber-100 bg-amber-50 px-3 py-2.5 text-left text-sm font-medium text-amber-800 hover:bg-amber-100">
+                        <StickyNote className="h-4 w-4 shrink-0" />Ajouter une note
+                      </button>
+                      {doc.status !== 'read' && doc.status !== 'archived' && (
+                        <button onClick={handleMarkRead} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-left text-sm font-medium text-gray-700 hover:bg-gray-100">
+                          <CheckSquare className="h-4 w-4 shrink-0" />Marquer comme lu
+                        </button>
+                      )}
+                      {doc.status !== 'archived' && (
+                        <button onClick={handleArchive} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-left text-sm font-medium text-gray-700 hover:bg-gray-100">
+                          <Archive className="h-4 w-4 shrink-0" />Archiver
+                        </button>
+                      )}
+                      {canManageTrash && (
+                        <button onClick={handleMoveToTrash} className="flex items-center gap-2 rounded-lg border border-danger-100 bg-danger-50 px-3 py-2.5 text-left text-sm font-medium text-danger-700 hover:bg-danger-100">
+                          <Trash2 className="h-4 w-4 shrink-0" />Supprimer
+                        </button>
+                      )}
+                      {isSpeechSupported() && (
+                        <button onClick={handleSpeak} className="flex items-center gap-2 rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 text-left text-sm font-medium text-gray-700 hover:bg-gray-100">
+                          {isPlaying ? <Square className="h-4 w-4 shrink-0" /> : <Volume2 className="h-4 w-4 shrink-0" />}
+                          {preparingReading ? 'Préparation...' : isPlaying ? 'Arrêter' : 'Écouter'}
+                        </button>
+                      )}
+                    </div>
+                  </section>
                   <div className="p-4 rounded-2xl bg-white border border-gray-100 shadow-sm">
                     <div className="flex flex-col sm:flex-row gap-2 mb-2">
                       <input
@@ -936,6 +1193,83 @@ export default function DocumentDetail({
           )}
         </div>
       </div>
+
+      {showSharePicker && (
+        <div className="fixed inset-0 bg-ink-900/40 backdrop-blur-sm z-50 flex items-center justify-center p-4 animate-fade-in">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 animate-slide-up max-h-[85vh] overflow-y-auto">
+            <div className="flex items-start justify-between mb-1 gap-3">
+              <h3 className="font-display font-bold text-gray-900 text-lg leading-tight flex items-center gap-2">
+                <Users className="w-5 h-5 text-primary-600" />
+                Partager le document
+              </h3>
+              <button onClick={() => setShowSharePicker(false)} className="text-gray-400 hover:text-gray-600 shrink-0">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <p className="text-xs text-gray-500 mb-4">
+              Sélectionnez une ou plusieurs personnes qui pourront voir ce document.
+            </p>
+            <div className="space-y-1.5">
+              {companyProfiles
+                .filter((member) => member.owner_id !== auth.currentUser?.uid)
+                .map((member) => {
+                  const checked = doc.shared_with?.includes(member.owner_id) ?? false;
+                  return (
+                    <label
+                      key={member.owner_id}
+                      className={`flex items-center gap-3 px-3 py-2.5 rounded-xl border cursor-pointer transition-colors ${
+                        checked ? 'border-primary-300 bg-primary-50' : 'border-gray-100 hover:border-gray-200'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={sharing}
+                        onChange={() => toggleShare(member.owner_id)}
+                        className="accent-primary-600 w-4 h-4"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-sm font-semibold text-gray-800 truncate">{member.full_name}</p>
+                        <p className="text-xs text-gray-400 truncate">{member.role_label} · {member.email}</p>
+                      </div>
+                      {checked && <Check className="w-4 h-4 text-primary-600 shrink-0" />}
+                    </label>
+                  );
+                })}
+              {companyProfiles.filter((member) => member.owner_id !== auth.currentUser?.uid).length === 0 && (
+                <p className="text-xs text-gray-400 text-center py-6">Aucun autre membre dans votre organisation.</p>
+              )}
+            </div>
+            <div className="flex justify-end mt-5">
+              <button
+                onClick={() => setShowSharePicker(false)}
+                className="px-4 py-2 rounded-xl text-sm font-semibold text-white bg-primary-600 hover:bg-primary-700 transition-colors"
+              >
+                Terminer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showCreateTask && (
+        <CreateTaskModal
+          companyProfiles={companyProfiles}
+          availableDocuments={availableDocuments}
+          sourceDocument={{ id: doc.id, title: doc.title }}
+          onClose={() => setShowCreateTask(false)}
+          onCreated={onDataChange}
+        />
+      )}
+    </div>
+  );
+}
+
+function EditField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="p-3 rounded-xl bg-gray-50 border border-gray-100">
+      <div className="text-xs text-gray-400 font-medium uppercase mb-1">{label}</div>
+      {children}
     </div>
   );
 }

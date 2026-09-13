@@ -1,8 +1,10 @@
 import { useCallback, useRef, useState } from 'react';
 import { getDownloadURL, ref as storageRef, uploadBytes } from 'firebase/storage';
 import { analyzeDocumentFile, type AIProcessResult, type AnalysisStep } from '@/lib/ai';
-import { auth, storage, firestore } from '@/lib/firebase';
+import { auth, storage, firestore, getActiveCompanyContext } from '@/lib/firebase';
 import type { DocumentDirection, Folder, RegisterInfo } from '@/lib/types';
+import type { UserRole } from '@/types';
+import { getArchiveDirectoryHandle, readStoragePreferences, saveFileToArchiveDirectory, saveFileToServer, type StorageMode } from '@/lib/storagePreferences';
 
 export type UploadStage = 'processing' | 'result' | 'saved' | 'error';
 export type UploadSource = 'upload' | 'camera' | 'scanner';
@@ -98,20 +100,25 @@ interface UseUploadFlowOptions {
   folders: Folder[];
   onUploaded: () => void;
   onFoldersChange: () => void;
+  /** Snapshotted onto each uploaded document as `owner_role` — drives the DG/Admin visibility rule. */
+  uploaderRole?: UserRole | null;
 }
 
-export function useUploadFlow({ folders, onUploaded, onFoldersChange }: UseUploadFlowOptions) {
+export function useUploadFlow({ folders, onUploaded, onFoldersChange, uploaderRole }: UseUploadFlowOptions) {
   const [isOpen, setIsOpen] = useState(false);
   const [jobs, setJobs] = useState<UploadJob[]>([]);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [draftDirection, setDraftDirection] = useState<DocumentDirection>('incoming');
+  const [savingJobIds, setSavingJobIds] = useState<Set<string>>(new Set());
+  const [storageMode, setStorageMode] = useState<StorageMode>(() => readStoragePreferences(getActiveCompanyContext()?.id).mode);
 
   const foldersRef = useRef(folders);
   foldersRef.current = folders;
 
   const activeJob = jobs.find((j) => j.id === activeJobId) ?? null;
   const isDraft = !activeJob;
+  const isSaving = activeJobId !== null && savingJobIds.has(activeJobId);
 
   const updateJob = useCallback((id: string, patch: Partial<UploadJob> | ((job: UploadJob) => Partial<UploadJob>)) => {
     setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, ...(typeof patch === 'function' ? patch(j) : patch) } : j)));
@@ -155,7 +162,7 @@ export function useUploadFlow({ folders, onUploaded, onFoldersChange }: UseUploa
     if (!file) {
       const job: UploadJob = {
         id, fileName: '', stage: 'error', steps: initialSteps(), edited: null,
-        error: "Choisissez un fichier PDF ou image pour que l'IA puisse en extraire le texte.",
+        error: "Choisissez un fichier PDF, Word (.doc/.docx) ou une image pour que l’IA puisse en extraire le texte.",
         selectedFile: null, activeSource: source, direction, receivedDate: todayISODate(),
         register: EMPTY_REGISTER, selectedFolderId: null,
       };
@@ -197,6 +204,11 @@ export function useUploadFlow({ folders, onUploaded, onFoldersChange }: UseUploa
     if (activeJobId) dismissJob(activeJobId);
   }, [activeJobId, dismissJob]);
 
+  /** After a save failure, go back to the filled-in result screen instead of discarding it. */
+  const retrySave = useCallback(() => {
+    if (activeJobId) updateJob(activeJobId, { stage: 'result', error: null });
+  }, [activeJobId, updateJob]);
+
   const updateEdited = useCallback((patch: Partial<AIProcessResult>) => {
     if (!activeJobId) return;
     updateJob(activeJobId, (job) => ({ edited: job.edited ? { ...job.edited, ...patch } : job.edited }));
@@ -224,49 +236,88 @@ export function useUploadFlow({ folders, onUploaded, onFoldersChange }: UseUploa
     const job = activeJob;
     if (!job || !job.edited) return;
     const id = job.id;
-    updateJob(id, { stage: 'saved' });
-    let imageUrl = '';
 
-    if (job.selectedFile && auth.currentUser) {
-      const path = `users/${auth.currentUser.uid}/documents/${Date.now()}-${job.selectedFile.name}`;
-      const uploaded = await uploadBytes(storageRef(storage, path), job.selectedFile);
-      imageUrl = await getDownloadURL(uploaded.ref);
-    }
+    setSavingJobIds((prev) => new Set(prev).add(id));
+    try {
+      let imageUrl = '';
 
-    const { data: savedDoc } = await firestore.from('documents').insert({
-      folder_id: job.selectedFolderId,
-      title: job.edited.title,
-      sender: job.edited.sender,
-      category: job.edited.category,
-      document_type: job.edited.document_type,
-      summary: job.edited.summary,
-      content_text: job.edited.content_text,
-      amount_due: job.edited.amount_due,
-      due_date: job.edited.due_date,
-      status: job.edited.status,
-      priority: job.edited.priority,
-      direction: job.direction,
-      received_date: new Date(job.receivedDate).toISOString(),
-      image_url: imageUrl,
-      processed_by: job.edited.processed_by ?? null,
-      register: job.register,
-    }).select().single();
+      if (job.selectedFile && auth.currentUser) {
+        if ((storageMode === 'local' || storageMode === 'hybrid') && !(await getArchiveDirectoryHandle())) {
+          throw new Error('Choisissez d’abord votre dossier d’archivage local dans Paramètres.');
+        }
+        const company = getActiveCompanyContext();
+        const storagePreferences = readStoragePreferences(company?.id);
+        const fileName = `${Date.now()}-${job.selectedFile.name}`;
+        if (storageMode === 'server' && !storagePreferences.serverUrl) throw new Error('Configurez d’abord l’URL du serveur local dans Paramètres.');
+        if (storageMode === 'cloud' || storageMode === 'hybrid') {
+          const path = company
+            ? `companies/${company.id}/documents/${fileName}`
+            : `users/${auth.currentUser.uid}/documents/${fileName}`;
+          const uploaded = await uploadBytes(storageRef(storage, path), job.selectedFile);
+          imageUrl = await getDownloadURL(uploaded.ref);
+        }
+        if (storageMode === 'local' || storageMode === 'hybrid') await saveFileToArchiveDirectory(job.selectedFile, fileName);
+        if (storageMode === 'server' || (storageMode === 'hybrid' && storagePreferences.serverUrl)) {
+          const serverUrl = storagePreferences.serverUrl;
+          const serverUrlResult = await saveFileToServer(job.selectedFile, serverUrl, fileName);
+          if (!imageUrl && serverUrlResult) imageUrl = serverUrlResult;
+        }
+      }
 
-    const savedDocId = (savedDoc as { id?: string } | null)?.id;
-    if (savedDocId && job.edited.due_date) {
-      await firestore.from('reminders').insert({
-        document_id: savedDocId,
-        title: `${job.edited.title} à échéance`,
-        remind_at: job.edited.due_date,
+      const { data: savedDoc, error: insertError } = await firestore.from('documents').insert({
+        folder_id: job.selectedFolderId,
+        title: job.edited.title,
+        sender: job.edited.sender,
+        category: job.edited.category,
+        document_type: job.edited.document_type,
+        summary: job.edited.summary,
+        content_text: job.edited.content_text,
+        amount_due: job.edited.amount_due,
+        due_date: job.edited.due_date,
+        status: job.edited.status,
+        priority: job.edited.priority,
+        direction: job.direction,
+        received_date: new Date(job.receivedDate).toISOString(),
+        image_url: imageUrl,
+        processed_by: job.edited.processed_by ?? null,
+        register: job.register,
+        owner_role: uploaderRole ?? null,
+      }).select().single();
+
+      if (insertError) throw new Error(insertError.message);
+
+      const savedDocId = (savedDoc as { id?: string } | null)?.id;
+      if (!savedDocId) throw new Error("L'enregistrement du document a échoué (aucun identifiant renvoyé).");
+
+      if (job.edited.due_date) {
+        await firestore.from('reminders').insert({
+          document_id: savedDocId,
+          title: `${job.edited.title} à échéance`,
+          remind_at: job.edited.due_date,
+        });
+      }
+
+      updateJob(id, { stage: 'saved' });
+      setTimeout(() => {
+        onUploaded();
+        dismissJob(id);
+        setIsOpen(false);
+      }, 1200);
+    } catch (err) {
+      updateJob(id, {
+        stage: 'error',
+        error: err instanceof Error
+          ? `Échec de l'enregistrement : ${err.message}`
+          : "Échec de l'enregistrement du document. Réessayez.",
+      });
+    } finally {
+      setSavingJobIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
       });
     }
-
-    setTimeout(() => {
-      onUploaded();
-      dismissJob(id);
-      setIsOpen(false);
-    }, 1200);
-  }, [activeJob, dismissJob, onUploaded, updateJob]);
+  }, [activeJob, dismissJob, onUploaded, storageMode, updateJob, uploaderRole]);
 
   return {
     isOpen,
@@ -275,6 +326,7 @@ export function useUploadFlow({ folders, onUploaded, onFoldersChange }: UseUploa
     jobs,
     activeJob,
     isDraft,
+    isSaving,
     draftDirection,
     setDraftDirection,
     dragOver,
@@ -291,6 +343,9 @@ export function useUploadFlow({ folders, onUploaded, onFoldersChange }: UseUploa
     setSelectedFolderId,
     handleFolderCreated,
     handleSave,
+    retrySave,
+    storageMode,
+    setStorageMode,
   };
 }
 

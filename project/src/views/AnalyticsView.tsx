@@ -163,7 +163,7 @@ export function AnalyticsView() {
               {/* Area */}
               <path
                 d={`M 0 ${160 - (processingTrend[0] / 5) * 140} L 120 ${160 - (processingTrend[1] / 5) * 140} L 240 ${160 - (processingTrend[2] / 5) * 140} L 360 ${160 - (processingTrend[3] / 5) * 140} L 480 ${160 - (processingTrend[4] / 5) * 140} L 600 ${160 - (processingTrend[5] / 5) * 140} L 600 160 L 0 160 Z`}
-                fill="url(#areaGradient)"
+                fill="rgb(37 99 235 / 0.12)"
               />
               {/* Line */}
               <path
@@ -174,12 +174,6 @@ export function AnalyticsView() {
                 strokeLinecap="round"
                 strokeLinejoin="round"
               />
-              <defs>
-                <linearGradient id="areaGradient" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor="rgb(50 134 252)" stopOpacity="0.15" />
-                  <stop offset="100%" stopColor="rgb(50 134 252)" stopOpacity="0" />
-                </linearGradient>
-              </defs>
               {/* Points */}
               {processingTrend.map((val, i) => (
                 <circle

@@ -28,9 +28,7 @@ export function LandingPage({ onLogin }: LandingPageProps) {
       <nav className="fixed top-0 inset-x-0 z-50 bg-white/80 backdrop-blur-lg border-b border-ink-100">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="h-9 w-9 rounded-xl bg-gradient-to-br from-primary-600 to-accent-600 flex items-center justify-center shadow-lg shadow-primary-600/20">
-              <FileText className="h-5 w-5 text-white" />
-            </div>
+            <img src="/logo-registre.png" alt="" className="h-9 w-9 rounded-lg bg-white object-contain p-0.5 shadow-sm" />
             <span className="font-display font-bold text-ink-900 text-lg">Registre intelligent</span>
           </div>
           <div className="hidden md:flex items-center gap-7">

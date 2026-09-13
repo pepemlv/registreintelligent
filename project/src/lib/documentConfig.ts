@@ -9,7 +9,7 @@ export const statusConfig: Record<
   assigned: { label: 'Affecté', bg: 'bg-primary-100', text: 'text-primary-700', dot: 'bg-primary-500' },
   in_review: { label: 'En révision', bg: 'bg-warning-100', text: 'text-warning-700', dot: 'bg-warning-500' },
   validated: { label: 'Validé', bg: 'bg-accent-100', text: 'text-accent-700', dot: 'bg-accent-500' },
-  closed: { label: 'Clôturé', bg: 'bg-ink-100', text: 'text-ink-600', dot: 'bg-ink-400' },
+  closed: { label: 'Terminée', bg: 'bg-ink-100', text: 'text-ink-600', dot: 'bg-ink-400' },
   overdue: { label: 'En retard', bg: 'bg-danger-100', text: 'text-danger-700', dot: 'bg-danger-500' },
 };
 
@@ -20,9 +20,9 @@ export const taskStatusConfig: Record<
   new: { label: 'Nouveau', bg: 'bg-ink-100', text: 'text-ink-700', dot: 'bg-ink-400' },
   assigned: { label: 'Affecté', bg: 'bg-primary-100', text: 'text-primary-700', dot: 'bg-primary-500' },
   in_progress: { label: 'En cours', bg: 'bg-warning-100', text: 'text-warning-700', dot: 'bg-warning-500' },
-  submitted: { label: 'Soumis', bg: 'bg-primary-100', text: 'text-primary-700', dot: 'bg-primary-400' },
+  submitted: { label: 'En révision', bg: 'bg-primary-100', text: 'text-primary-700', dot: 'bg-primary-400' },
   validated: { label: 'Validé', bg: 'bg-accent-100', text: 'text-accent-700', dot: 'bg-accent-500' },
-  closed: { label: 'Clôturé', bg: 'bg-ink-100', text: 'text-ink-600', dot: 'bg-ink-400' },
+  closed: { label: 'Terminée', bg: 'bg-ink-100', text: 'text-ink-600', dot: 'bg-ink-400' },
 };
 
 export const mailStatusConfig: Record<

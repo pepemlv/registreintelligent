@@ -68,7 +68,7 @@ export default function FolderPicker({ folders, selectedFolderId, onSelect, onFo
     <div className="relative">
       <button
         onClick={() => setOpen((v) => !v)}
-        className="px-3 py-1.5 text-sm text-gray-600 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors flex items-center gap-1.5"
+        className="px-3 py-1.5 text-sm font-semibold text-gray-900 bg-yellow-400 hover:bg-yellow-500 rounded-lg transition-colors flex items-center gap-1.5"
       >
         <FolderInput className="w-4 h-4" />
         {selected ? selected.name : (label ?? 'Ajouter à un dossier')}

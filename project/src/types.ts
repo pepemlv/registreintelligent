@@ -40,7 +40,7 @@ export type TaskStatus =
   | 'validated'
   | 'closed';
 
-export type UserRole = 'super_admin' | 'dg' | 'manager' | 'collaborator' | 'external';
+export type UserRole = 'ORGANIZATION_ADMIN' | 'EXECUTIVE' | 'UNIT_MANAGER' | 'UNIT_SECRETARY' | 'AGENT';
 
 export interface DocumentParty {
   name: string;
@@ -288,6 +288,12 @@ export interface RFQ {
   createdDate: string;
   deadline: string;
   deliveryLocation: string;
+  supplierScope?: 'local' | 'national';
+  supplierCategory?: 'prime' | 'fabricant' | 'revendeur' | 'prestataire' | 'sous_traitant';
+  /** Who can see and respond to this RFQ: everyone, a set of service/product categories, or hand-picked companies. */
+  visibility?: 'all' | 'category' | 'specific';
+  visibilityCategories?: string[];
+  visibilitySupplierIds?: string[];
   description: string;
   hasAttachment: boolean;
   attachmentName?: string;
