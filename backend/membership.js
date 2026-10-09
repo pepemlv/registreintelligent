@@ -8,6 +8,8 @@ import Stripe from 'stripe';
  * - POST /api/billing/membership/checkout  → Stripe Checkout URL for the signed-in member:
  *     { autoPay: true }  (default) monthly subscription charged automatically
  *     { autoPay: false } one-time $10 payment for the next unpaid month
+ *     { embedded: true }  Stripe Embedded Checkout shown inside the app → returns { clientSecret }
+ *                         (otherwise a hosted Checkout page → returns { url })
  * - POST /api/billing/membership/portal    → Stripe customer portal URL (update card, invoices)
  * - GET  /api/billing/membership/status    → auto pay, next payment date, card on file
  * - POST /api/billing/membership/cancel    → stop auto pay; membership ends at the end of the paid period
@@ -268,6 +270,12 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
       const customerId = await ensureCustomer(profile, req.user);
 
       const base = returnBase(req, isAllowedOrigin);
+      const embedded = req.body?.embedded === true;
+      // Embedded: the form lives in the app and completion is handled there (no redirect).
+      const presentation = embedded
+        ? { ui_mode: 'embedded', redirect_on_completion: 'never' }
+        : { success_url: `${base}/?membership=success`, cancel_url: `${base}/?membership=canceled` };
+      const reply = (session, extra = {}) => res.json(embedded ? { clientSecret: session.client_secret, ...extra } : { url: session.url, ...extra });
 
       if (!autoPay) {
         const month = nextUnpaidMonth(normalize(data.bill_benefit));
@@ -285,10 +293,9 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
               product_data: { name: `SPS Bill Benefit membership — ${month}` },
             },
           }],
-          success_url: `${base}/?membership=success`,
-          cancel_url: `${base}/?membership=canceled`,
+          ...presentation,
         });
-        return res.json({ url: oneTime.url, month });
+        return reply(oneTime, { month });
       }
 
       // This month already paid (e.g. a one-time payment): start charging from the 1st of next month
@@ -316,10 +323,9 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
             },
           }],
         allow_promotion_codes: true,
-        success_url: `${base}/?membership=success`,
-        cancel_url: `${base}/?membership=canceled`,
+        ...presentation,
       });
-      return res.json({ url: session.url });
+      return reply(session);
     } catch (error) {
       return stripeFailure(res, next, error);
     }
