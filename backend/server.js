@@ -1,10 +1,13 @@
-﻿import 'dotenv/config';
+import 'dotenv/config';
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import cors from 'cors';
 import express from 'express';
 import admin from 'firebase-admin';
 import WordExtractor from 'word-extractor';
+import { registerMembershipRoutes, registerStripeWebhook } from './membership.js';
+import { execFile } from 'node:child_process';
+import { readFile, unlink } from 'node:fs/promises';
 
 const requiredEnvironment = ['FIREBASE_SERVICE_ACCOUNT'];
 const missingEnvironment = requiredEnvironment.filter((key) => !process.env[key]);
@@ -146,6 +149,15 @@ function isAllowedOrigin(origin) {
   }
 }
 
+// Chrome's Private Network Access: the hosted HTTPS site calls this backend on localhost
+// to reach the user's scanner, which needs this opt-in on the CORS preflight.
+app.use((req, res, next) => {
+  if (req.headers['access-control-request-private-network']) {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  }
+  next();
+});
+
 app.use(cors({
   origin(origin, callback) {
     if (isAllowedOrigin(origin)) return callback(null, true);
@@ -154,6 +166,8 @@ app.use(cors({
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Authorization', 'Content-Type'],
 }));
+// Stripe needs the raw request body to verify webhook signatures, so it goes before express.json.
+registerStripeWebhook(app);
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '50mb' }));
 
 async function requireFirebaseUser(req, res, next) {
@@ -373,6 +387,37 @@ function looksLikeRawJson(value) {
   return (trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'));
 }
 
+const appointmentTypes = new Set(['medical', 'legal', 'administrative', 'professional', 'friendly', 'family', 'other']);
+
+function isoDate(value) {
+  const v = text(value, 20);
+  return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null;
+}
+
+function normalizeBillDetection(value) {
+  if (!value || typeof value !== 'object' || value.isBillToPay !== true) return null;
+  const amount = Number(value.amount);
+  return {
+    payee: text(value.payee, 200) || '',
+    service: text(value.service, 200) || '',
+    amount: value.amount !== null && value.amount !== undefined && Number.isFinite(amount) ? amount : null,
+    currency: text(value.currency, 8) || 'USD',
+    dueDate: isoDate(value.dueDate),
+  };
+}
+
+function normalizeAppointmentDetection(value) {
+  if (!value || typeof value !== 'object' || value.isAppointment !== true) return null;
+  const time = text(value.time, 5);
+  return {
+    type: appointmentTypes.has(value.type) ? value.type : 'other',
+    organizer: text(value.organizer, 200) || '',
+    date: isoDate(value.date),
+    time: time && /^\d{2}:\d{2}$/.test(time) ? time : '',
+    location: text(value.location, 300) || '',
+  };
+}
+
 function normalizeAnalysis(value) {
   const analysis = value && typeof value === 'object' ? value : {};
   const category = documentCategories.has(analysis.category) ? analysis.category : 'Other';
@@ -393,6 +438,8 @@ function normalizeAnalysis(value) {
     tags: Array.isArray(analysis.tags) ? analysis.tags.map((item) => text(item, 60)).filter(Boolean).slice(0, 8) : [],
     keywords: Array.isArray(analysis.keywords) ? analysis.keywords.map((item) => text(item, 60)).filter(Boolean).slice(0, 12) : [],
     language: text(analysis.language, 8) || 'fr',
+    bill: normalizeBillDetection(analysis.bill),
+    appointment: normalizeAppointmentDetection(analysis.appointment),
   };
 }
 
@@ -401,6 +448,8 @@ Analyze only the provided document text. Never invent missing values.
 Write the summary, document type, field names, tags, keywords, and all user-facing analysis text in French only. Do not translate or rewrite the original document text itself; only the analysis output must be French.
 Preserve proper names and official organization names in their original form.
 Set expirationDate only when the document explicitly identifies a valid expiration, due, or deadline date. Never interpret a file number, dossier number, certificate number, reference, or issue date as an expiration date.
+Set bill.isBillToPay to true only when the document explicitly asks the recipient to pay an outstanding amount (invoice, utility bill, tax notice, payment request). Receipts, paid invoices, bank statements and quotes are NOT bills to pay. bill.payee is who must be paid, bill.service is the product or service being billed, bill.dueDate is the payment deadline.
+Set appointment.isAppointment to true only when the document explicitly convenes or schedules the recipient at a given date (medical appointment, court hearing, administrative convocation, meeting, interview, invitation). appointment.type: medical, legal (court, lawyer, notary), administrative (public office, prefecture, tax office), professional (work meeting, interview), friendly (party, invitation from friends), family, or other. appointment.organizer is who sends the appointment, appointment.location is the full address or place.
 Return valid JSON only, without markdown, using exactly this shape:
 {
   "category": "Invoice|Medical Report|Bank Statement|Passport|Driver License|Tax|Insurance|Employment Contract|Birth Certificate|Receipt|Utility Bill|Academic|Legal|Other",
@@ -416,7 +465,9 @@ Return valid JSON only, without markdown, using exactly this shape:
   "keyPoints": ["string: 5 to 10 important facts, figures, decisions, risks, discrepancies, pending actions or recommendations explicitly supported by the document"],
   "tags": ["string"],
   "keywords": ["string"],
-  "language": "ISO 639-1 language code"
+  "language": "ISO 639-1 language code",
+  "bill": { "isBillToPay": false, "payee": "string|null", "service": "string|null", "amount": "number|null", "currency": "ISO 4217 currency code", "dueDate": "YYYY-MM-DD|null" },
+  "appointment": { "isAppointment": false, "type": "medical|legal|administrative|professional|friendly|family|other", "organizer": "string|null", "date": "YYYY-MM-DD|null", "time": "HH:MM|null", "location": "string|null" }
 }
 Write an extended but practical French summary. It must be useful for a manager who has not read the document: explain what the document is about, who is involved, what is requested or decided, what amounts or deadlines matter, what action should happen next, and any risk or urgency. Use 2 to 5 short paragraphs or compact bullet-style sentences. Also return 5 to 10 concise keyPoints when the document contains enough information; include material figures, progress, variances, blockers, pending payments, expected funding, recommendations and follow-up periods. Never infer or invent facts. Confidence must be between 0 and 1. Use null when a value is absent.`;
 
@@ -425,6 +476,8 @@ Ignore QR codes, barcodes, and similar scannable codes: do not decode, transcrib
 Never invent missing values. Preserve proper names and official organization names in their original form.
 Write the summary, document type, field names, tags, keywords, and all user-facing analysis text in French only. Do not translate or rewrite the original document text itself.
 Set expirationDate only when the document explicitly identifies a valid expiration, due, or deadline date. Never interpret a file number, dossier number, certificate number, reference, or issue date as an expiration date.
+Set bill.isBillToPay to true only when the document explicitly asks the recipient to pay an outstanding amount (invoice, utility bill, tax notice, payment request). Receipts, paid invoices, bank statements and quotes are NOT bills to pay. bill.payee is who must be paid, bill.service is the product or service being billed, bill.dueDate is the payment deadline.
+Set appointment.isAppointment to true only when the document explicitly convenes or schedules the recipient at a given date (medical appointment, court hearing, administrative convocation, meeting, interview, invitation). appointment.type: medical, legal (court, lawyer, notary), administrative (public office, prefecture, tax office), professional (work meeting, interview), friendly (party, invitation from friends), family, or other. appointment.organizer is who sends the appointment, appointment.location is the full address or place.
 Return valid JSON only, without markdown, using exactly this shape, with "analysis" BEFORE "fullText" in your output:
 {
   "analysis": {
@@ -441,7 +494,9 @@ Return valid JSON only, without markdown, using exactly this shape, with "analys
     "keyPoints": ["string: 5 to 10 important facts, figures, decisions, risks, discrepancies, pending actions or recommendations explicitly supported by the document"],
     "tags": ["string"],
     "keywords": ["string"],
-    "language": "ISO 639-1 language code"
+    "language": "ISO 639-1 language code",
+    "bill": { "isBillToPay": false, "payee": "string|null", "service": "string|null", "amount": "number|null", "currency": "ISO 4217 currency code", "dueDate": "YYYY-MM-DD|null" },
+    "appointment": { "isAppointment": false, "type": "medical|legal|administrative|professional|friendly|family|other", "organizer": "string|null", "date": "YYYY-MM-DD|null", "time": "HH:MM|null", "location": "string|null" }
   },
   "fullText": "the complete text you read from every page, in the document's original language and wording, with each page separated by a line reading \\"Page N\\""
 }
@@ -631,6 +686,8 @@ function localChatAnswer(question, documentText) {
 }
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
+registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOrigin });
 
 app.post('/api/ai/analyze', requireFirebaseUser, async (req, res, next) => {
   try {
@@ -965,6 +1022,109 @@ app.post('/api/ai/consolidate', requireFirebaseUser, async (req, res, next) => {
     return res.json({ consolidated, engine });
   } catch (error) {
     return next(error);
+  }
+});
+
+// ---------------------------------------------------------------------------------------
+// Local scanner (Windows WIA). Only useful when this backend runs on the user's own PC,
+// where the printer-scanner is installed.
+// ---------------------------------------------------------------------------------------
+const scannerTimeoutMs = Number(process.env.SCANNER_TIMEOUT_MS || 180000);
+const WIA_FORMAT_JPEG = '{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}';
+
+const SCANNER_MESSAGES = {
+  '0x80210015': 'No scanner was found. Check that the printer-scanner is on, connected to this PC or the network, and that its WIA driver is installed.',
+  '0x80210006': 'The scanner is busy. Wait for the current job to finish, then try again.',
+  '0x80210002': 'Paper jam in the scanner. Clear the jam, then try again.',
+  '0x80210003': 'The document feeder is empty. Load the pages, then try again.',
+  '0x80210001': 'The scanner reported a general error. Restart it, then try again.',
+  '0x80210005': 'The scanner is offline. Turn it on or reconnect it, then try again.',
+  '0x8021000A': 'The scanner cover is open. Close it, then try again.',
+  '0x8021000C': 'The scanner is warming up. Wait a moment, then try again.',
+  '0x80210016': 'The scanner is no longer connected. Reconnect it, then try again.',
+  SERVICE: 'The Windows Image Acquisition (WIA) service could not be started. Start the "stisvc" service, then try again.',
+  NO_DEVICE: 'No WIA scanner is installed on this computer. Add your printer-scanner in Windows Settings > Printers & scanners (TWAIN-only drivers are not supported).',
+};
+
+function scannerError(message, status = 500) {
+  return Object.assign(new Error(message), { status, expose: true });
+}
+
+const wiaScanScript = `
+$ErrorActionPreference = 'Stop'
+try {
+  $svc = Get-Service -Name stisvc -ErrorAction SilentlyContinue
+  if (-not $svc) { Write-Output 'SCANERR:SERVICE|stisvc missing'; exit 0 }
+  if ($svc.Status -ne 'Running') {
+    try { Start-Service -Name stisvc } catch { Write-Output ('SCANERR:SERVICE|' + $_.Exception.Message); exit 0 }
+  }
+  $dm = New-Object -ComObject WIA.DeviceManager
+  $scanners = @($dm.DeviceInfos | Where-Object { $_.Type -eq 1 })
+  if ($scanners.Count -eq 0) { Write-Output 'SCANERR:NO_DEVICE|no scanner'; exit 0 }
+  $dialog = New-Object -ComObject WIA.CommonDialog
+  # DeviceType 1 = scanner, Intent 1 = colour; AlwaysSelectDevice shows the Windows device picker.
+  $image = $dialog.ShowAcquireImage(1, 1, 0, '${WIA_FORMAT_JPEG}', $true, $true, $false)
+  if (-not $image) { Write-Output 'SCANERR:CANCELLED|cancelled'; exit 0 }
+  if ($image.FormatID -ne '${WIA_FORMAT_JPEG}') {
+    $process = New-Object -ComObject WIA.ImageProcess
+    $process.Filters.Add($process.FilterInfos.Item('Convert').FilterID)
+    $process.Filters.Item(1).Properties.Item('FormatID').Value = '${WIA_FORMAT_JPEG}'
+    $image = $process.Apply($image)
+  }
+  $path = Join-Path $env:TEMP ('registre-scan-' + [guid]::NewGuid().ToString() + '.jpg')
+  $image.SaveFile($path)
+  Write-Output $path
+} catch {
+  $code = '0x{0:X8}' -f $_.Exception.HResult
+  Write-Output ('SCANERR:' + $code + '|' + $_.Exception.Message)
+}
+`;
+
+function scanWithWindowsWia() {
+  if (process.platform !== 'win32') {
+    return Promise.reject(scannerError('Scanning is only available when the backend runs on the Windows PC the scanner is connected to.', 501));
+  }
+  return new Promise((resolve, reject) => {
+    execFile(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', wiaScanScript],
+      { timeout: scannerTimeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) {
+          const timedOut = error.killed || error.signal === 'SIGTERM';
+          reject(scannerError(timedOut ? 'The scan took too long and was stopped. Try again.' : `The scan failed: ${(stderr || error.message).trim()}`));
+          return;
+        }
+        const line = stdout.trim().split(/\r?\n/).pop() || '';
+        if (line.startsWith('SCANERR:')) {
+          const [code, ...rest] = line.slice('SCANERR:'.length).split('|');
+          if (code === 'CANCELLED') { reject(Object.assign(scannerError('Scan cancelled.', 499), { cancelled: true })); return; }
+          reject(scannerError(SCANNER_MESSAGES[code.toUpperCase().replace(/^0X/, '0x')] || `The scan failed (${code}): ${rest.join('|')}`, code === 'NO_DEVICE' || code === '0x80210015' ? 404 : 500));
+          return;
+        }
+        resolve(line);
+      },
+    );
+  });
+}
+
+let scannerBusy = false;
+
+app.post('/api/scanner/scan', requireFirebaseUser, async (_req, res, next) => {
+  if (scannerBusy) return res.status(409).json({ error: SCANNER_MESSAGES['0x80210006'] });
+  scannerBusy = true;
+  try {
+    const filePath = await scanWithWindowsWia();
+    const data = await readFile(filePath);
+    await unlink(filePath).catch(() => {});
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    return res.json({ fileName: `scan-${stamp}.jpg`, mimeType: 'image/jpeg', base64: data.toString('base64') });
+  } catch (error) {
+    if (error?.cancelled) return res.status(499).json({ error: error.message, cancelled: true });
+    if (error?.expose) return res.status(error.status || 500).json({ error: error.message });
+    return next(error);
+  } finally {
+    scannerBusy = false;
   }
 });
 
