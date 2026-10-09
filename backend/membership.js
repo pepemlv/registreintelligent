@@ -11,6 +11,7 @@ import Stripe from 'stripe';
  *     { embedded: true }  Stripe Embedded Checkout shown inside the app → returns { clientSecret }
  *                         (otherwise a hosted Checkout page → returns { url })
  * - POST /api/billing/membership/portal    → Stripe customer portal URL (update card, invoices)
+ * - GET  /api/billing/config               → Stripe publishable key for the in-app payment form
  * - GET  /api/billing/membership/status    → auto pay, next payment date, card on file
  * - POST /api/billing/membership/cancel    → stop auto pay; membership ends at the end of the paid period
  * - POST /api/billing/membership/resume    → undo a pending cancellation
@@ -254,6 +255,13 @@ async function handleEvent(event) {
 /* ------------------------------------------------------------------ */
 
 export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOrigin }) {
+  // Public: the publishable key (pk_…) is meant for browsers; it lets the app show Stripe's
+  // payment form in place without a separate front-end setting.
+  app.get('/api/billing/config', (_req, res) => {
+    const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY || '';
+    res.json({ publishableKey: publishableKey.startsWith('pk_') ? publishableKey : '' });
+  });
+
   app.post('/api/billing/membership/checkout', requireFirebaseUser, async (req, res, next) => {
     try {
       if (!requireStripe(res)) return;
