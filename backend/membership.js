@@ -12,6 +12,10 @@ import Stripe from 'stripe';
  *                         (otherwise a hosted Checkout page → returns { url })
  * - POST /api/billing/membership/portal    → Stripe customer portal URL (update card, invoices)
  * - GET  /api/billing/config               → Stripe publishable key for the in-app payment form
+ * - POST /api/billing/membership/intent    → client secret for the app's own payment form (Stripe Elements):
+ *     { autoPay: true }  incomplete monthly subscription, confirmed by the form (first invoice's PaymentIntent,
+ *                        or a SetupIntent when the first charge is deferred to next month)
+ *     { autoPay: false } PaymentIntent for one month, recorded by the payment_intent.succeeded webhook
  * - GET  /api/billing/membership/status    → auto pay, next payment date, card on file
  * - POST /api/billing/membership/cancel    → stop auto pay; membership ends at the end of the paid period
  * - POST /api/billing/membership/resume    → undo a pending cancellation
@@ -117,6 +121,19 @@ async function ensureCustomer(profile, user) {
   return customer.id;
 }
 
+let cachedProductId = null;
+/** Stripe product for the membership (found by metadata, created once). */
+async function membershipProductId() {
+  if (cachedProductId) return cachedProductId;
+  const found = await stripe.products.search({ query: "metadata['sps']:'bill_benefit_membership'" }).catch(() => ({ data: [] }));
+  cachedProductId = found.data[0]?.id
+    ?? (await stripe.products.create({ name: 'SPS Bill Benefit membership', metadata: { sps: 'bill_benefit_membership' } })).id;
+  return cachedProductId;
+}
+
+/** Subscription statuses where auto pay is actually charging (incomplete ones are abandoned forms). */
+const LIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing', 'past_due']);
+
 function requireStripe(res) {
   if (stripe) return true;
   res.status(503).json({ error: 'Membership payments are not available right now.' });
@@ -146,6 +163,15 @@ function nextUnpaidMonth(membership) {
   const current = monthKey(now);
   if (!membership.payments.some((payment) => payment.month === current)) return current;
   return monthKey(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)));
+}
+
+/**
+ * Events from an older subscription (e.g. a payment form opened but never completed, which Stripe
+ * expires later) must not overwrite the member's current, paying subscription.
+ */
+function supersededSubscription(profileData, subscription) {
+  const storedId = profileData.stripe_subscription_id;
+  return Boolean(storedId) && storedId !== subscription.id && LIVE_SUBSCRIPTION_STATUSES.has(profileData.stripe_subscription_status);
 }
 
 /** Subscription fields mirrored on the profile (read-only for the app). */
@@ -213,6 +239,21 @@ async function handleEvent(event) {
       return;
     }
 
+    case 'payment_intent.succeeded': {
+      const intent = event.data.object;
+      // Subscription invoices are recorded by invoice.paid; this handles one-time membership payments.
+      if (!intent.metadata?.membership_month || intent.metadata?.kind !== 'membership_one_time') return;
+      const payer = await resolveProfile({ uid: intent.metadata.uid, customerId: intent.customer });
+      if (!payer) return;
+      await recordPaidMonth(payer.ref, {
+        month: intent.metadata.membership_month,
+        amount: intent.amount_received / 100,
+        paidAt: new Date(intent.created * 1000).toISOString(),
+        reference: intent.id,
+      });
+      return;
+    }
+
     case 'invoice.paid': {
       const invoice = event.data.object;
       if (!invoice.subscription || !invoice.amount_paid) return;
@@ -231,6 +272,7 @@ async function handleEvent(event) {
       const subscription = event.data.object;
       const profile = await resolveProfile({ uid: subscription.metadata?.uid, customerId: subscription.customer });
       if (!profile) return;
+      if (supersededSubscription(profile.data(), subscription)) return;
       await profile.ref.update({ stripe_customer_id: subscription.customer, ...subscriptionFields(subscription) });
       return;
     }
@@ -239,6 +281,7 @@ async function handleEvent(event) {
       const subscription = event.data.object;
       const profile = await resolveProfile({ uid: subscription.metadata?.uid, customerId: subscription.customer });
       if (!profile) return;
+      if (supersededSubscription(profile.data(), subscription)) return;
       await updateMembership(profile.ref, (current) => ({
         membership: { ...current, status: 'canceled', canceled_at: new Date().toISOString(), cycle_start_month: null },
         extra: { stripe_subscription_id: null, stripe_subscription_status: 'canceled', stripe_cancel_at_period_end: false, stripe_current_period_end: null },
@@ -270,7 +313,7 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
       if (!profile) return res.status(404).json({ error: 'Your account profile could not be found.' });
       const data = profile.data();
       const autoPay = req.body?.autoPay !== false;
-      const autoPayRunning = Boolean(data.stripe_subscription_id) && data.stripe_subscription_status !== 'canceled';
+      const autoPayRunning = Boolean(data.stripe_subscription_id) && LIVE_SUBSCRIPTION_STATUSES.has(data.stripe_subscription_status);
       if (autoPayRunning) {
         return res.status(409).json({ error: autoPay ? 'Auto pay is already on for your membership.' : 'Auto pay already pays your membership every month.' });
       }
@@ -334,6 +377,64 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
         ...presentation,
       });
       return reply(session);
+    } catch (error) {
+      return stripeFailure(res, next, error);
+    }
+  });
+
+  app.post('/api/billing/membership/intent', requireFirebaseUser, async (req, res, next) => {
+    try {
+      if (!requireStripe(res)) return;
+      const uid = req.user.uid;
+      const profile = await findProfileByOwner(uid);
+      if (!profile) return res.status(404).json({ error: 'Your account profile could not be found.' });
+      const data = profile.data();
+      const membership = normalize(data.bill_benefit);
+      const autoPay = req.body?.autoPay !== false;
+      if (data.stripe_subscription_id && LIVE_SUBSCRIPTION_STATUSES.has(data.stripe_subscription_status)) {
+        return res.status(409).json({ error: autoPay ? 'Auto pay is already on for your membership.' : 'Auto pay already pays your membership every month.' });
+      }
+      const customerId = await ensureCustomer(profile, req.user);
+
+      if (!autoPay) {
+        const month = nextUnpaidMonth(membership);
+        const intent = await stripe.paymentIntents.create({
+          amount: monthlyFeeCents,
+          currency: 'usd',
+          customer: customerId,
+          automatic_payment_methods: { enabled: true },
+          description: `SPS Bill Benefit membership — ${month}`,
+          metadata: { uid, membership_month: month, kind: 'membership_one_time' },
+        });
+        return res.json({ clientSecret: intent.client_secret, type: 'payment', month, amount: monthlyFeeCents / 100 });
+      }
+
+      // Auto pay: an incomplete subscription whose first payment the form confirms. If this month
+      // is already paid, the first charge waits until the 1st of next month (card saved now).
+      const now = new Date();
+      const firstOfNextMonth = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1) / 1000);
+      const currentMonthPaid = membership.payments.some((payment) => payment.month === monthKey(now));
+      const deferFirstCharge = currentMonthPaid && firstOfNextMonth - now.getTime() / 1000 > 48 * 3600;
+
+      const subscription = await stripe.subscriptions.create({
+        customer: customerId,
+        items: [priceId
+          ? { price: priceId }
+          : { price_data: { currency: 'usd', unit_amount: monthlyFeeCents, recurring: { interval: 'month' }, product: await membershipProductId() } }],
+        payment_behavior: 'default_incomplete',
+        payment_settings: { save_default_payment_method: 'on_subscription' },
+        metadata: { uid },
+        ...(deferFirstCharge ? { trial_end: firstOfNextMonth } : {}),
+        expand: ['latest_invoice.payment_intent', 'pending_setup_intent'],
+      });
+      const paymentIntent = subscription.latest_invoice?.payment_intent;
+      if (paymentIntent?.client_secret) {
+        return res.json({ clientSecret: paymentIntent.client_secret, type: 'payment', subscriptionId: subscription.id, amount: monthlyFeeCents / 100 });
+      }
+      if (subscription.pending_setup_intent?.client_secret) {
+        return res.json({ clientSecret: subscription.pending_setup_intent.client_secret, type: 'setup', subscriptionId: subscription.id, amount: monthlyFeeCents / 100 });
+      }
+      return res.status(500).json({ error: 'The payment could not be prepared. Please try again.' });
     } catch (error) {
       return stripeFailure(res, next, error);
     }
