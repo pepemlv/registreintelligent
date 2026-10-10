@@ -22,7 +22,9 @@ import Stripe from 'stripe';
  * - POST /api/stripe/webhook               → Stripe events; the only place paid months are recorded
  *
  * Everything the app shows is saved in Firestore by this module, so the app never waits on Stripe:
- * - profile.bill_benefit   { status, started_at, canceled_at, cycle_start_month, payments: [{ month, amount, paid_at, stripe_invoice_id }], claims }
+ * - profile.bill_benefit   { status, started_at, canceled_at, anchor_date, cycle_start,
+ *                            payments: [{ period_start, month, amount, paid_at, stripe_invoice_id }], claims }
+ *   Membership periods run one month from the day of the first payment (anchor_date): Oct 9 → Nov 9 → Dec 9…
  * - profile.stripe_billing { status, auto_pay, cancel_at_period_end, current_period_end, amount, card: { brand, last4, exp_month, exp_year },
  *                            last_payment: { amount, month, paid_at, status }, updated_at }
  * - membership_payments/{stripe id}  one document per payment attempt (paid or failed), readable by its owner
@@ -38,22 +40,92 @@ const stripe = secretKey ? new Stripe(secretKey) : null;
 if (!stripe) console.warn('Stripe is not configured (STRIPE_SECRET_KEY): membership payments are disabled.');
 else if (!webhookSecret) console.warn('STRIPE_WEBHOOK_SECRET is missing: paid months will not be recorded.');
 
-function monthKey(date) {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+/** "YYYY-MM-DD" (UTC). */
+function dateKey(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function parseDateKey(key) {
+  const [year, month, day] = key.slice(0, 10).split('-').map(Number);
+  return new Date(Date.UTC(year, month - 1, day || 1));
+}
+
+/** Same day `count` months later, clamped to the month's last day (Jan 31 + 1 → Feb 28). */
+function addMonthsToDate(key, count) {
+  const base = parseDateKey(key);
+  const target = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth() + count, 1));
+  const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(base.getUTCDate(), lastDay));
+  return dateKey(target);
+}
+
+function periodStart(anchor, index) {
+  return addMonthsToDate(anchor, index);
+}
+
+function periodIndexAt(anchor, key) {
+  if (key < anchor) return -1;
+  const a = parseDateKey(anchor);
+  const k = parseDateKey(key);
+  let index = (k.getUTCFullYear() - a.getUTCFullYear()) * 12 + (k.getUTCMonth() - a.getUTCMonth());
+  while (index > 0 && periodStart(anchor, index) > key) index -= 1;
+  while (periodStart(anchor, index + 1) <= key) index += 1;
+  return Math.max(0, index);
 }
 
 function emptyMembership() {
-  return { status: 'none', started_at: null, canceled_at: null, cycle_start_month: null, payments: [], claims: [] };
+  return { status: 'none', started_at: null, canceled_at: null, anchor_date: null, cycle_start: null, payments: [], claims: [] };
 }
 
+/** Normalises bill_benefit; older per-calendar-month data is anchored on its first payment's date. */
 function normalize(raw) {
   const value = raw && typeof raw === 'object' ? raw : {};
+  const rawPayments = Array.isArray(value.payments) ? value.payments.filter((p) => p && (p.period_start || p.month)) : [];
+  const byPaidDate = [...rawPayments].sort((a, b) => String(a.paid_at).localeCompare(String(b.paid_at)));
+  const anchor = value.anchor_date || (byPaidDate[0]?.paid_at ? dateKey(new Date(byPaidDate[0].paid_at)) : null);
+  const used = new Set(rawPayments.map((p) => p.period_start).filter(Boolean));
+  let legacyIndex = 0;
+  const payments = byPaidDate.map((p) => {
+    let start = p.period_start;
+    if (!start && anchor) {
+      while (used.has(periodStart(anchor, legacyIndex))) legacyIndex += 1;
+      start = periodStart(anchor, legacyIndex);
+      used.add(start);
+    }
+    start ??= dateKey(new Date(p.paid_at ?? Date.now()));
+    return { ...p, period_start: start, month: start.slice(0, 7) };
+  });
+  const { cycle_start_month: _legacyCycle, ...rest } = value;
   return {
     ...emptyMembership(),
-    ...value,
-    payments: Array.isArray(value.payments) ? value.payments : [],
+    ...rest,
+    anchor_date: anchor,
+    cycle_start: value.cycle_start || anchor,
+    payments,
     claims: Array.isArray(value.claims) ? value.claims : [],
   };
+}
+
+/** Period the next payment covers: starts today for a first payment, else the first unpaid period from now. */
+function nextPayablePeriod(membership, now = new Date()) {
+  const today = dateKey(now);
+  if (!membership.anchor_date) return today;
+  const paid = new Set(membership.payments.map((payment) => payment.period_start));
+  let index = periodIndexAt(membership.anchor_date, today);
+  while (paid.has(periodStart(membership.anchor_date, index)) && index < 1200) index += 1;
+  return periodStart(membership.anchor_date, index);
+}
+
+/** When auto pay starts while the current period is already paid: Unix time of the next period, else null (charge now). */
+function autoPayStart(membership, now = new Date()) {
+  if (!membership.anchor_date) return null;
+  const next = nextPayablePeriod(membership, now);
+  return next > dateKey(now) ? periodTimestamp(next) : null;
+}
+
+/** Unix time (noon UTC) of a period start, for Stripe's billing anchor. */
+function periodTimestamp(key) {
+  return Math.floor(Date.parse(`${key}T12:00:00Z`) / 1000);
 }
 
 async function findProfileByOwner(uid) {
@@ -143,29 +215,37 @@ function requireStripe(res) {
   return false;
 }
 
-/** Records a paid month (idempotent per month / Stripe reference) and activates the membership. */
-async function recordPaidMonth(profileRef, { month, amount, paidAt, reference }) {
+/**
+ * Records a payment (idempotent per Stripe reference) and activates the membership. The first payment
+ * sets the anchor: periods then run one month from that day. `period` is the period the payment was
+ * prepared for; if it was paid meanwhile, the next unpaid period is used. Returns the period covered.
+ */
+async function recordPayment(profileRef, { period, amount, paidAt, reference }) {
+  let covered = null;
   await updateMembership(profileRef, (current) => {
-    if (current.payments.some((payment) => payment.month === month || payment.stripe_invoice_id === reference)) return { membership: current };
-    const activated = current.status === 'active'
-      ? current
-      : { ...current, status: 'active', started_at: current.started_at ?? paidAt, canceled_at: null, cycle_start_month: month };
+    const existing = current.payments.find((payment) => payment.stripe_invoice_id === reference);
+    if (existing) {
+      covered = existing.period_start;
+      return { membership: current };
+    }
+    const paidDate = new Date(paidAt);
+    const anchor = current.anchor_date ?? dateKey(paidDate);
+    const withAnchor = { ...current, anchor_date: anchor, cycle_start: current.cycle_start ?? anchor };
+    const taken = new Set(current.payments.map((payment) => payment.period_start));
+    const start = !current.anchor_date ? anchor : period && !taken.has(period) && period >= anchor ? period : nextPayablePeriod(withAnchor, paidDate);
+    covered = start;
     return {
       membership: {
-        ...activated,
-        payments: [...current.payments, { month, amount, paid_at: paidAt, stripe_invoice_id: reference }]
-          .sort((a, b) => String(a.month).localeCompare(String(b.month))),
+        ...withAnchor,
+        status: 'active',
+        started_at: current.started_at ?? paidAt,
+        canceled_at: null,
+        payments: [...current.payments, { period_start: start, month: start.slice(0, 7), amount, paid_at: paidAt, stripe_invoice_id: reference }]
+          .sort((a, b) => String(a.period_start).localeCompare(String(b.period_start))),
       },
     };
   });
-}
-
-/** Month a one-time payment covers: this month, or the next one when this month is already paid. */
-function nextUnpaidMonth(membership) {
-  const now = new Date();
-  const current = monthKey(now);
-  if (!membership.payments.some((payment) => payment.month === current)) return current;
-  return monthKey(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)));
+  return covered;
 }
 
 /**
@@ -219,7 +299,8 @@ async function savePaymentRecord(profile, payment) {
     owner_id: data.owner_id ?? null,
     profile_id: profile.id,
     company_id: data.company_id ?? null,
-    month: payment.month ?? null,
+    period_start: payment.period ?? null,
+    month: payment.period ? payment.period.slice(0, 7) : null,
     amount: payment.amount,
     currency: 'usd',
     type: payment.type,
@@ -237,7 +318,7 @@ async function savePaymentRecord(profile, payment) {
   }, { merge: true });
   await profile.ref.set({
     stripe_billing: {
-      last_payment: { amount: payment.amount, month: payment.month ?? null, paid_at: payment.paidAt ?? now, status: payment.status },
+      last_payment: { amount: payment.amount, period_start: payment.period ?? null, paid_at: payment.paidAt ?? now, status: payment.status },
       ...(payment.card ? { card: payment.card } : {}),
       updated_at: now,
     },
@@ -303,16 +384,16 @@ async function handleEvent(event) {
   switch (event.type) {
     case 'checkout.session.completed': {
       const session = event.data.object;
-      if (session.mode === 'payment' && session.metadata?.membership_month) {
+      if (session.mode === 'payment' && (session.metadata?.membership_period || session.metadata?.membership_month)) {
         if (session.payment_status !== 'paid') return;
         const payer = await resolveProfile({ uid: session.client_reference_id || session.metadata?.uid, customerId: session.customer });
         if (!payer) return;
         const paidAt = iso(session.created) ?? new Date().toISOString();
         const amount = (session.amount_total ?? monthlyFeeCents) / 100;
-        await recordPaidMonth(payer.ref, { month: session.metadata.membership_month, amount, paidAt, reference: session.payment_intent || session.id });
+        const covered = await recordPayment(payer.ref, { period: session.metadata.membership_period, amount, paidAt, reference: session.payment_intent || session.id });
         const details = await chargeDetails(session.payment_intent);
         await savePaymentRecord(payer, {
-          id: session.payment_intent || session.id, type: 'one_time', status: 'paid', month: session.metadata.membership_month,
+          id: session.payment_intent || session.id, type: 'one_time', status: 'paid', period: covered,
           amount, paidAt, paymentIntentId: session.payment_intent, ...details,
         });
         return;
@@ -322,9 +403,8 @@ async function handleEvent(event) {
       if (!profile) return;
       const now = new Date();
       await updateMembership(profile.ref, (current) => ({
-        membership: current.status === 'active'
-          ? current
-          : { ...current, status: 'active', started_at: now.toISOString(), canceled_at: null, cycle_start_month: monthKey(now) },
+        // The anchor (first payment day) is set when the first invoice is recorded.
+        membership: current.status === 'active' ? current : { ...current, status: 'active', started_at: now.toISOString(), canceled_at: null },
         extra: { stripe_customer_id: session.customer, stripe_subscription_id: session.subscription },
       }));
       return;
@@ -333,14 +413,14 @@ async function handleEvent(event) {
     case 'payment_intent.succeeded': {
       const intent = event.data.object;
       // Subscription invoices are recorded by invoice.paid; this handles one-time membership payments.
-      if (!intent.metadata?.membership_month || intent.metadata?.kind !== 'membership_one_time') return;
+      if (intent.metadata?.kind !== 'membership_one_time') return;
       const payer = await resolveProfile({ uid: intent.metadata.uid, customerId: intent.customer });
       if (!payer) return;
       const paidAt = iso(intent.created);
       const amount = intent.amount_received / 100;
-      await recordPaidMonth(payer.ref, { month: intent.metadata.membership_month, amount, paidAt, reference: intent.id });
+      const covered = await recordPayment(payer.ref, { period: intent.metadata.membership_period, amount, paidAt, reference: intent.id });
       await savePaymentRecord(payer, {
-        id: intent.id, type: 'one_time', status: 'paid', month: intent.metadata.membership_month, amount, paidAt,
+        id: intent.id, type: 'one_time', status: 'paid', period: covered, amount, paidAt,
         paymentIntentId: intent.id, ...(await chargeDetails(intent.id)),
       });
       return;
@@ -352,7 +432,7 @@ async function handleEvent(event) {
       const payer = await resolveProfile({ uid: intent.metadata.uid, customerId: intent.customer });
       if (!payer) return;
       await savePaymentRecord(payer, {
-        id: intent.id, type: 'one_time', status: 'failed', month: intent.metadata.membership_month, amount: intent.amount / 100,
+        id: intent.id, type: 'one_time', status: 'failed', period: intent.metadata.membership_period ?? null, amount: intent.amount / 100,
         paidAt: iso(intent.created), paymentIntentId: intent.id, card: cardInfo(intent.last_payment_error?.payment_method?.card),
         failureReason: intent.last_payment_error?.message ?? null,
       });
@@ -364,13 +444,11 @@ async function handleEvent(event) {
       if (!invoice.subscription || !invoice.amount_paid) return;
       const profile = await resolveProfile({ uid: invoice.subscription_details?.metadata?.uid, customerId: invoice.customer });
       if (!profile) return;
-      const periodStart = invoice.lines?.data?.[0]?.period?.start ?? invoice.period_start;
-      const month = monthKey(new Date(periodStart * 1000));
       const paidAt = new Date((invoice.status_transitions?.paid_at ?? invoice.created) * 1000).toISOString();
-      await recordPaidMonth(profile.ref, { month, amount: invoice.amount_paid / 100, paidAt, reference: invoice.id });
+      const covered = await recordPayment(profile.ref, { amount: invoice.amount_paid / 100, paidAt, reference: invoice.id });
       await profile.ref.update({ stripe_customer_id: invoice.customer });
       await savePaymentRecord(profile, {
-        id: invoice.id, type: 'subscription', status: 'paid', month, amount: invoice.amount_paid / 100, paidAt,
+        id: invoice.id, type: 'subscription', status: 'paid', period: covered, amount: invoice.amount_paid / 100, paidAt,
         invoiceId: invoice.id, paymentIntentId: invoice.payment_intent, subscriptionId: invoice.subscription,
         ...(await chargeDetails(invoice.payment_intent)),
         ...(invoice.hosted_invoice_url ? { receiptUrl: invoice.hosted_invoice_url } : {}),
@@ -383,9 +461,8 @@ async function handleEvent(event) {
       if (!invoice.subscription) return;
       const profile = await resolveProfile({ uid: invoice.subscription_details?.metadata?.uid, customerId: invoice.customer });
       if (!profile) return;
-      const periodStart = invoice.lines?.data?.[0]?.period?.start ?? invoice.period_start;
       await savePaymentRecord(profile, {
-        id: invoice.id, type: 'subscription', status: 'failed', month: monthKey(new Date(periodStart * 1000)),
+        id: invoice.id, type: 'subscription', status: 'failed', period: nextPayablePeriod(normalize(profile.data().bill_benefit)),
         amount: invoice.amount_due / 100, paidAt: iso(invoice.created), invoiceId: invoice.id,
         paymentIntentId: invoice.payment_intent, subscriptionId: invoice.subscription,
         failureReason: invoice.last_finalization_error?.message ?? 'The card payment failed.',
@@ -409,7 +486,8 @@ async function handleEvent(event) {
       if (!profile) return;
       if (supersededSubscription(profile.data(), subscription)) return;
       await updateMembership(profile.ref, (current) => ({
-        membership: { ...current, status: 'canceled', canceled_at: new Date().toISOString(), cycle_start_month: null },
+        // Progress is lost: the next first payment starts a new count from its own date.
+        membership: { ...current, status: 'canceled', canceled_at: new Date().toISOString(), anchor_date: null, cycle_start: null },
         extra: { stripe_subscription_id: null, stripe_subscription_status: 'canceled', stripe_cancel_at_period_end: false, stripe_current_period_end: null },
       }));
       await profile.ref.set({
@@ -458,39 +536,35 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
       const reply = (session, extra = {}) => res.json(embedded ? { clientSecret: session.client_secret, ...extra } : { url: session.url, ...extra });
 
       if (!autoPay) {
-        const month = nextUnpaidMonth(normalize(data.bill_benefit));
+        const period = nextPayablePeriod(normalize(data.bill_benefit));
         const oneTime = await stripe.checkout.sessions.create({
           mode: 'payment',
           customer: customerId,
           client_reference_id: uid,
-          metadata: { uid, membership_month: month },
-          payment_intent_data: { metadata: { uid, membership_month: month } },
+          metadata: { uid, membership_period: period },
+          payment_intent_data: { metadata: { uid, membership_period: period } },
           line_items: [{
             quantity: 1,
             price_data: {
               currency: 'usd',
               unit_amount: monthlyFeeCents,
-              product_data: { name: `SPS Bill Benefit membership — ${month}` },
+              product_data: { name: `SPS Bill Benefit membership — from ${period}` },
             },
           }],
           ...presentation,
         });
-        return reply(oneTime, { month });
+        return reply(oneTime, { period });
       }
 
-      // This month already paid (e.g. a one-time payment): start charging from the 1st of next month
-      // instead of billing the same month twice. Stripe needs a trial end at least 48 hours away.
-      const now = new Date();
-      const firstOfNextMonth = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1) / 1000;
-      const currentMonthPaid = normalize(data.bill_benefit).payments.some((payment) => payment.month === monthKey(now));
-      const deferFirstCharge = currentMonthPaid && firstOfNextMonth - now.getTime() / 1000 > 48 * 3600;
+      // Current period already paid (e.g. one-time): first automatic charge on the next period's date.
+      const firstCharge = autoPayStart(normalize(data.bill_benefit));
 
       const session = await stripe.checkout.sessions.create({
         mode: 'subscription',
         customer: customerId,
         client_reference_id: uid,
         metadata: { uid },
-        subscription_data: { metadata: { uid }, ...(deferFirstCharge ? { trial_end: Math.floor(firstOfNextMonth) } : {}) },
+        subscription_data: { metadata: { uid }, ...(firstCharge ? { billing_cycle_anchor: firstCharge, proration_behavior: 'none' } : {}) },
         line_items: [priceId
           ? { price: priceId, quantity: 1 }
           : {
@@ -526,24 +600,22 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
       const customerId = await ensureCustomer(profile, req.user);
 
       if (!autoPay) {
-        const month = nextUnpaidMonth(membership);
+        const period = nextPayablePeriod(membership);
         const intent = await stripe.paymentIntents.create({
           amount: monthlyFeeCents,
           currency: 'usd',
           customer: customerId,
           automatic_payment_methods: { enabled: true },
-          description: `SPS Bill Benefit membership — ${month}`,
-          metadata: { uid, membership_month: month, kind: 'membership_one_time' },
+          description: `SPS Bill Benefit membership — period from ${period}`,
+          metadata: { uid, membership_period: period, kind: 'membership_one_time' },
         });
-        return res.json({ clientSecret: intent.client_secret, type: 'payment', month, amount: monthlyFeeCents / 100 });
+        return res.json({ clientSecret: intent.client_secret, type: 'payment', period, amount: monthlyFeeCents / 100 });
       }
 
-      // Auto pay: an incomplete subscription whose first payment the form confirms. If this month
-      // is already paid, the first charge waits until the 1st of next month (card saved now).
-      const now = new Date();
-      const firstOfNextMonth = Math.floor(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1) / 1000);
-      const currentMonthPaid = membership.payments.some((payment) => payment.month === monthKey(now));
-      const deferFirstCharge = currentMonthPaid && firstOfNextMonth - now.getTime() / 1000 > 48 * 3600;
+      // Auto pay: an incomplete subscription whose first payment the form confirms. Stripe then bills on
+      // the same day every month. If the current period is already paid, the first charge waits until
+      // the next period's date (card saved now, nothing due today).
+      const firstCharge = autoPayStart(membership);
 
       const subscription = await stripe.subscriptions.create({
         customer: customerId,
@@ -553,7 +625,7 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
         payment_behavior: 'default_incomplete',
         payment_settings: { save_default_payment_method: 'on_subscription' },
         metadata: { uid },
-        ...(deferFirstCharge ? { trial_end: firstOfNextMonth } : {}),
+        ...(firstCharge ? { billing_cycle_anchor: firstCharge, proration_behavior: 'none' } : {}),
         expand: ['latest_invoice.payment_intent', 'pending_setup_intent'],
       });
       const paymentIntent = subscription.latest_invoice?.payment_intent;
