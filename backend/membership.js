@@ -21,8 +21,11 @@ import Stripe from 'stripe';
  * - POST /api/billing/membership/resume    → undo a pending cancellation
  * - POST /api/stripe/webhook               → Stripe events; the only place paid months are recorded
  *
- * Membership state lives on the member's profile as `bill_benefit` (same shape the web app reads):
- * { status, started_at, canceled_at, cycle_start_month, payments: [{ month, amount, paid_at, stripe_invoice_id }], claims }
+ * Everything the app shows is saved in Firestore by this module, so the app never waits on Stripe:
+ * - profile.bill_benefit   { status, started_at, canceled_at, cycle_start_month, payments: [{ month, amount, paid_at, stripe_invoice_id }], claims }
+ * - profile.stripe_billing { status, auto_pay, cancel_at_period_end, current_period_end, amount, card: { brand, last4, exp_month, exp_year },
+ *                            last_payment: { amount, month, paid_at, status }, updated_at }
+ * - membership_payments/{stripe id}  one document per payment attempt (paid or failed), readable by its owner
  */
 
 const secretKey = process.env.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_TEST || '';
@@ -174,6 +177,92 @@ function supersededSubscription(profileData, subscription) {
   return Boolean(storedId) && storedId !== subscription.id && LIVE_SUBSCRIPTION_STATUSES.has(profileData.stripe_subscription_status);
 }
 
+function iso(seconds) {
+  return seconds ? new Date(seconds * 1000).toISOString() : null;
+}
+
+function cardInfo(card) {
+  return card ? { brand: card.brand, last4: card.last4, exp_month: card.exp_month, exp_year: card.exp_year } : null;
+}
+
+/** Card used and receipt link for a PaymentIntent (best effort: the payment is saved even without them). */
+async function chargeDetails(paymentIntentId) {
+  if (!paymentIntentId) return { card: null, receiptUrl: null };
+  try {
+    const intent = await stripe.paymentIntents.retrieve(paymentIntentId, { expand: ['latest_charge'] });
+    const charge = intent.latest_charge;
+    return { card: cardInfo(charge?.payment_method_details?.card), receiptUrl: charge?.receipt_url ?? null };
+  } catch (error) {
+    console.warn('Could not read payment details', paymentIntentId, error.message);
+    return { card: null, receiptUrl: null };
+  }
+}
+
+async function paymentMethodCard(paymentMethod) {
+  if (!paymentMethod) return null;
+  if (typeof paymentMethod === 'object') return cardInfo(paymentMethod.card);
+  try {
+    return cardInfo((await stripe.paymentMethods.retrieve(paymentMethod)).card);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Saves one payment in membership_payments (document id = Stripe id, so retries never duplicate)
+ * and the "last payment" / card summary on the profile.
+ */
+async function savePaymentRecord(profile, payment) {
+  const data = profile.data();
+  const now = new Date().toISOString();
+  await admin.firestore().collection('membership_payments').doc(payment.id).set({
+    owner_id: data.owner_id ?? null,
+    profile_id: profile.id,
+    company_id: data.company_id ?? null,
+    month: payment.month ?? null,
+    amount: payment.amount,
+    currency: 'usd',
+    type: payment.type,
+    status: payment.status,
+    card_brand: payment.card?.brand ?? null,
+    card_last4: payment.card?.last4 ?? null,
+    receipt_url: payment.receiptUrl ?? null,
+    failure_reason: payment.failureReason ?? null,
+    stripe_invoice_id: payment.invoiceId ?? null,
+    stripe_payment_intent_id: payment.paymentIntentId ?? null,
+    stripe_subscription_id: payment.subscriptionId ?? null,
+    paid_at: payment.status === 'paid' ? payment.paidAt : null,
+    created_at: payment.paidAt ?? now,
+    updated_at: now,
+  }, { merge: true });
+  await profile.ref.set({
+    stripe_billing: {
+      last_payment: { amount: payment.amount, month: payment.month ?? null, paid_at: payment.paidAt ?? now, status: payment.status },
+      ...(payment.card ? { card: payment.card } : {}),
+      updated_at: now,
+    },
+  }, { merge: true });
+}
+
+/** Mirrors a subscription on the profile: flat fields (used by the server) + stripe_billing summary (read by the app). */
+async function syncSubscription(profileRef, subscription, extra = {}) {
+  const card = await paymentMethodCard(subscription.default_payment_method);
+  const live = LIVE_SUBSCRIPTION_STATUSES.has(subscription.status);
+  await profileRef.set({
+    ...subscriptionFields(subscription),
+    ...extra,
+    stripe_billing: {
+      status: subscription.status,
+      auto_pay: live && !subscription.cancel_at_period_end,
+      cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
+      current_period_end: iso(subscription.current_period_end),
+      amount: (subscription.items?.data?.[0]?.price?.unit_amount ?? monthlyFeeCents) / 100,
+      ...(card ? { card } : {}),
+      updated_at: new Date().toISOString(),
+    },
+  }, { merge: true });
+}
+
 /** Subscription fields mirrored on the profile (read-only for the app). */
 function subscriptionFields(subscription) {
   return {
@@ -218,11 +307,13 @@ async function handleEvent(event) {
         if (session.payment_status !== 'paid') return;
         const payer = await resolveProfile({ uid: session.client_reference_id || session.metadata?.uid, customerId: session.customer });
         if (!payer) return;
-        await recordPaidMonth(payer.ref, {
-          month: session.metadata.membership_month,
-          amount: (session.amount_total ?? monthlyFeeCents) / 100,
-          paidAt: new Date((session.created ?? Date.now() / 1000) * 1000).toISOString(),
-          reference: session.payment_intent || session.id,
+        const paidAt = iso(session.created) ?? new Date().toISOString();
+        const amount = (session.amount_total ?? monthlyFeeCents) / 100;
+        await recordPaidMonth(payer.ref, { month: session.metadata.membership_month, amount, paidAt, reference: session.payment_intent || session.id });
+        const details = await chargeDetails(session.payment_intent);
+        await savePaymentRecord(payer, {
+          id: session.payment_intent || session.id, type: 'one_time', status: 'paid', month: session.metadata.membership_month,
+          amount, paidAt, paymentIntentId: session.payment_intent, ...details,
         });
         return;
       }
@@ -245,11 +336,25 @@ async function handleEvent(event) {
       if (!intent.metadata?.membership_month || intent.metadata?.kind !== 'membership_one_time') return;
       const payer = await resolveProfile({ uid: intent.metadata.uid, customerId: intent.customer });
       if (!payer) return;
-      await recordPaidMonth(payer.ref, {
-        month: intent.metadata.membership_month,
-        amount: intent.amount_received / 100,
-        paidAt: new Date(intent.created * 1000).toISOString(),
-        reference: intent.id,
+      const paidAt = iso(intent.created);
+      const amount = intent.amount_received / 100;
+      await recordPaidMonth(payer.ref, { month: intent.metadata.membership_month, amount, paidAt, reference: intent.id });
+      await savePaymentRecord(payer, {
+        id: intent.id, type: 'one_time', status: 'paid', month: intent.metadata.membership_month, amount, paidAt,
+        paymentIntentId: intent.id, ...(await chargeDetails(intent.id)),
+      });
+      return;
+    }
+
+    case 'payment_intent.payment_failed': {
+      const intent = event.data.object;
+      if (intent.metadata?.kind !== 'membership_one_time') return;
+      const payer = await resolveProfile({ uid: intent.metadata.uid, customerId: intent.customer });
+      if (!payer) return;
+      await savePaymentRecord(payer, {
+        id: intent.id, type: 'one_time', status: 'failed', month: intent.metadata.membership_month, amount: intent.amount / 100,
+        paidAt: iso(intent.created), paymentIntentId: intent.id, card: cardInfo(intent.last_payment_error?.payment_method?.card),
+        failureReason: intent.last_payment_error?.message ?? null,
       });
       return;
     }
@@ -264,6 +369,27 @@ async function handleEvent(event) {
       const paidAt = new Date((invoice.status_transitions?.paid_at ?? invoice.created) * 1000).toISOString();
       await recordPaidMonth(profile.ref, { month, amount: invoice.amount_paid / 100, paidAt, reference: invoice.id });
       await profile.ref.update({ stripe_customer_id: invoice.customer });
+      await savePaymentRecord(profile, {
+        id: invoice.id, type: 'subscription', status: 'paid', month, amount: invoice.amount_paid / 100, paidAt,
+        invoiceId: invoice.id, paymentIntentId: invoice.payment_intent, subscriptionId: invoice.subscription,
+        ...(await chargeDetails(invoice.payment_intent)),
+        ...(invoice.hosted_invoice_url ? { receiptUrl: invoice.hosted_invoice_url } : {}),
+      });
+      return;
+    }
+
+    case 'invoice.payment_failed': {
+      const invoice = event.data.object;
+      if (!invoice.subscription) return;
+      const profile = await resolveProfile({ uid: invoice.subscription_details?.metadata?.uid, customerId: invoice.customer });
+      if (!profile) return;
+      const periodStart = invoice.lines?.data?.[0]?.period?.start ?? invoice.period_start;
+      await savePaymentRecord(profile, {
+        id: invoice.id, type: 'subscription', status: 'failed', month: monthKey(new Date(periodStart * 1000)),
+        amount: invoice.amount_due / 100, paidAt: iso(invoice.created), invoiceId: invoice.id,
+        paymentIntentId: invoice.payment_intent, subscriptionId: invoice.subscription,
+        failureReason: invoice.last_finalization_error?.message ?? 'The card payment failed.',
+      });
       return;
     }
 
@@ -273,7 +399,7 @@ async function handleEvent(event) {
       const profile = await resolveProfile({ uid: subscription.metadata?.uid, customerId: subscription.customer });
       if (!profile) return;
       if (supersededSubscription(profile.data(), subscription)) return;
-      await profile.ref.update({ stripe_customer_id: subscription.customer, ...subscriptionFields(subscription) });
+      await syncSubscription(profile.ref, subscription, { stripe_customer_id: subscription.customer });
       return;
     }
 
@@ -286,6 +412,9 @@ async function handleEvent(event) {
         membership: { ...current, status: 'canceled', canceled_at: new Date().toISOString(), cycle_start_month: null },
         extra: { stripe_subscription_id: null, stripe_subscription_status: 'canceled', stripe_cancel_at_period_end: false, stripe_current_period_end: null },
       }));
+      await profile.ref.set({
+        stripe_billing: { status: 'canceled', auto_pay: false, cancel_at_period_end: false, current_period_end: null, updated_at: new Date().toISOString() },
+      }, { merge: true });
       return;
     }
 
@@ -480,7 +609,7 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
         await profile.ref.update({ stripe_subscription_id: null, stripe_subscription_status: null });
         return res.json({ subscribed: false });
       }
-      await profile.ref.update(subscriptionFields(subscription));
+      await syncSubscription(profile.ref, subscription);
       let card = subscription.default_payment_method?.card ?? null;
       if (!card && subscription.customer) {
         const customer = await stripe.customers.retrieve(subscription.customer, { expand: ['invoice_settings.default_payment_method'] });
@@ -506,7 +635,7 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
       const own = await ownSubscription(req, res);
       if (!own) return;
       const subscription = await stripe.subscriptions.update(own.subscriptionId, { cancel_at_period_end: true });
-      await own.profile.ref.update(subscriptionFields(subscription));
+      await syncSubscription(own.profile.ref, subscription);
       return res.json({ ok: true, ...subscriptionFields(subscription) });
     } catch (error) {
       return stripeFailure(res, next, error);
@@ -519,7 +648,7 @@ export function registerMembershipRoutes(app, { requireFirebaseUser, isAllowedOr
       const own = await ownSubscription(req, res);
       if (!own) return;
       const subscription = await stripe.subscriptions.update(own.subscriptionId, { cancel_at_period_end: false });
-      await own.profile.ref.update(subscriptionFields(subscription));
+      await syncSubscription(own.profile.ref, subscription);
       return res.json({ ok: true, ...subscriptionFields(subscription) });
     } catch (error) {
       return stripeFailure(res, next, error);
